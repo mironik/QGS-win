@@ -5,7 +5,9 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-libva = { version = "0.1.4", default-features = false, features = ["linked"] }
 qgs-codec-h264 = { version = "0.1.0", path = "../qgs-codec-h264" }
+
+[target.'cfg(unix)'.dependencies]
+libva = { version = "0.1.4", default-features = false, features = ["linked"] }
 qgs-core = { path = "../qgs-core" }
 qgs-protocol = { path = "../qgs-protocol" }

@@ -6,8 +6,10 @@ version.workspace = true
 description = "Media-capable Broadcast Player LEGO bricks (decode/GPU/audio/monitor)"
 
 [dependencies]
-qgs-audio-pipewire = { path = "../qgs-audio-pipewire" }
 qgs-codec-h264 = { path = "../qgs-codec-h264" }
+
+[target.'cfg(unix)'.dependencies]
+qgs-audio-pipewire = { path = "../qgs-audio-pipewire" }
 qgs-core = { path = "../qgs-core" }
 qgs-h264-422p10 = { path = "../qgs-h264-422p10" }
 qgs-linux = { path = "../qgs-linux" }

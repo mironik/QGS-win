@@ -5,6 +5,8 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-ash = { version = "0.38.0", default-features = false, features = ["linked", "std", "debug"] }
 qgs-core = { path = "../qgs-core" }
+
+[target.'cfg(unix)'.dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["linked", "std", "debug"] }
 qgs-protocol = { path = "../qgs-protocol" }

@@ -7,4 +7,6 @@ version.workspace = true
 [dependencies]
 qgs-core = { path = "../qgs-core" }
 qgs-protocol = { path = "../qgs-protocol" }
+
+[target.'cfg(unix)'.dependencies]
 rsmpeg = { version = "0.18.0", default-features = false, features = ["ffmpeg8", "link_system_ffmpeg"] }

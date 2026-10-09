@@ -15,8 +15,10 @@ members = [
     "crates/qgs-software-video",
     "crates/qgs-vaapi",
     "crates/qgs-vulkan",
+    "crates/qgs-windows",
     "daemon/qgsd",
     "tools/qgs-test",
+    "tools/qgs-win",
 ]
 resolver = "2"
 

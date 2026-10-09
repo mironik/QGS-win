@@ -1,0 +1,13 @@
+[package]
+name = "qgs-windows"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Windows host for the QGS wire protocol and WASAPI playback"
+
+[dependencies]
+qgs-core = { path = "../qgs-core" }
+qgs-protocol = { path = "../qgs-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.25.0"

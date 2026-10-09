@@ -1,0 +1,9 @@
+[package]
+name = "qgs-win"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Windows QGS host: protocol server and WASAPI playback"
+
+[dependencies]
+qgs-windows = { path = "../../crates/qgs-windows" }
