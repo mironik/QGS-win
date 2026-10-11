@@ -5,6 +5,7 @@ use qgs_codec_h264::{
     H264DecoderState, H264PictureId, H264SliceKind, ParsedH264AccessUnit, ParsedH264Slice,
 };
 use rusty_h264_common::cabac_tables::CTX_INIT;
+use smallvec::SmallVec;
 
 use crate::cabac::{CabacContext, CabacDecoder, CabacError, CabacInitValue};
 use crate::cabac_macroblock::{
@@ -26,10 +27,13 @@ use crate::cabac_residual_422::CabacResidualDecoder422;
 use crate::deblock::DeblockGrid;
 use crate::frame::{DecodedFrame422P10, Plane422P10};
 use crate::macroblock::{
-    add_chroma_residual_422, add_chroma_residual_422_prescaled, add_luma_residual_16x16,
-    add_luma_residual_8x8, reconstruct_chroma_422_intra, reconstruct_intra16x16_luma_dc,
-    reconstruct_intra4x4_luma, reconstruct_intra8x8_luma, ChromaPlane, Intra16x16Macroblock,
-    Intra4x4PredictionMode, MacroblockReconstructionError,
+    add_chroma_residual_422_prescaled, add_luma_residual_16x16,
+    add_luma_residual_16x16_predequantized, add_luma_residual_8x8, reconstruct_chroma_422_intra,
+    reconstruct_inter_chroma_422_local, reconstruct_inter_luma_16x16_local,
+    reconstruct_inter_luma_16x16_local_predequantized, reconstruct_inter_luma_8x8_local,
+    reconstruct_intra16x16_luma_dc, reconstruct_intra4x4_luma, reconstruct_intra8x8_luma,
+    store_local_inter_prediction, write_local_chroma_8x16, write_local_luma_16x16, ChromaPlane,
+    Intra16x16Macroblock, Intra4x4PredictionMode, MacroblockReconstructionError,
 };
 use crate::macroblock_type::{
     BPredictionList, BSliceMacroblockType, BSubMacroblockType, CodedBlockPatternChroma,
@@ -37,13 +41,21 @@ use crate::macroblock_type::{
     PSubMacroblockType,
 };
 use crate::motion::{
-    predict_bi_inter_16x16, predict_bi_inter_16x8, predict_bi_inter_8x16, predict_bi_inter_region,
-    predict_inter_16x16, predict_inter_16x8, predict_inter_8x16, predict_inter_region,
+    predict_bi_inter_16x16, predict_bi_inter_16x8, predict_bi_inter_8x16,
+    predict_bi_inter_chroma_16x16_blocks, predict_bi_inter_luma_16x16_block,
+    predict_bi_inter_region, predict_inter_16x16, predict_inter_16x8, predict_inter_8x16,
+    predict_inter_chroma_16x16_blocks, predict_inter_chroma_region_into,
+    predict_inter_luma_16x16_block, predict_inter_luma_region_into, predict_inter_region,
     MotionCompensationError, MotionField, MotionSample, MotionVectorQuarterPel,
 };
-use crate::residual::{ResidualBlock4x4, ResidualBlock8x8};
+use crate::residual::{PictureScaling, ResidualBlock4x4, ResidualBlock8x8};
 use crate::slice::{
     slice_luma_qp, slice_payload_from_parsed, SliceMacroblockCursor, SlicePayloadError,
+};
+use crate::sony_fast::{SonyDirect16x16Command, SonyDirectMotion};
+use crate::sony_plan::{
+    execute_sony_slice_plan, PlanCommand, PlanExecuteError, PlanKernel, PlanLumaResidual,
+    SonySlicePlan,
 };
 use crate::{
     validate_original_profile, H264422P10Error, H264422P10Frame, H264422P10Plane, H264422P10Profile,
@@ -55,6 +67,24 @@ pub struct H264422P10Decoder {
     expected: H264422P10Profile,
     next_presentation_index: u64,
     decoded: BTreeMap<(u16, i32), DecodedPicture>,
+    frame_pool: Vec<DecodedFrame422P10>,
+    motion_pool: Vec<MotionField>,
+    scratch: Option<PictureScratch>,
+}
+
+#[derive(Debug)]
+struct PictureScratch {
+    motion_field: MotionField,
+    mvd_syntax: MvdSyntaxField,
+    intra16_or_pcm: Vec<Option<bool>>,
+    chroma_pred_modes: Vec<Option<u8>>,
+    intra_luma_prediction_modes: Vec<Option<[Intra4x4PredictionMode; 16]>>,
+    coded_block_patterns: Vec<u8>,
+    transform_size_8x8_flags: Vec<bool>,
+    skip_flags: Vec<bool>,
+    direct_flags: Vec<bool>,
+    ref_idx_l0: Vec<[u8; 4]>,
+    ref_idx_l1: Vec<[u8; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +117,47 @@ impl Default for H264422P10Decoder {
     }
 }
 
+impl PictureScratch {
+    fn new(grid: MacroblockGrid) -> Result<Self, H264422P10PictureDecodeError> {
+        let count = grid.macroblock_count() as usize;
+        Ok(Self {
+            motion_field: MotionField::new(grid)?,
+            mvd_syntax: MvdSyntaxField::new(grid)?,
+            intra16_or_pcm: vec![None; count],
+            chroma_pred_modes: vec![None; count],
+            intra_luma_prediction_modes: vec![None; count],
+            coded_block_patterns: vec![0; count],
+            transform_size_8x8_flags: vec![false; count],
+            skip_flags: vec![false; count],
+            direct_flags: vec![false; count],
+            ref_idx_l0: vec![[0; 4]; count],
+            ref_idx_l1: vec![[0; 4]; count],
+        })
+    }
+
+    fn clear(&mut self) {
+        self.motion_field.clear();
+        self.mvd_syntax.clear();
+        self.intra16_or_pcm.fill(None);
+        self.chroma_pred_modes.fill(None);
+        self.intra_luma_prediction_modes.fill(None);
+        self.coded_block_patterns.fill(0);
+        self.transform_size_8x8_flags.fill(false);
+        self.skip_flags.fill(false);
+        self.direct_flags.fill(false);
+        for slot in &mut self.ref_idx_l0 {
+            *slot = [0; 4];
+        }
+        for slot in &mut self.ref_idx_l1 {
+            *slot = [0; 4];
+        }
+    }
+
+    fn matches_grid(&self, grid: MacroblockGrid) -> bool {
+        self.motion_field.matches_grid(grid) && self.mvd_syntax.matches_grid(grid)
+    }
+}
+
 impl H264422P10Decoder {
     pub fn new(expected: H264422P10Profile) -> Self {
         Self {
@@ -94,6 +165,54 @@ impl H264422P10Decoder {
             expected,
             next_presentation_index: 0,
             decoded: BTreeMap::new(),
+            frame_pool: Vec::new(),
+            motion_pool: Vec::new(),
+            scratch: None,
+        }
+    }
+
+    fn take_frame(
+        &mut self,
+        coded_width: usize,
+        coded_height: usize,
+        visible_width: usize,
+        visible_height: usize,
+    ) -> DecodedFrame422P10 {
+        if let Some(index) = self.frame_pool.iter().position(|frame| {
+            frame.matches_geometry(coded_width, coded_height, visible_width, visible_height)
+        }) {
+            let mut frame = self.frame_pool.swap_remove(index);
+            frame.clear_for_reuse();
+            return frame;
+        }
+        DecodedFrame422P10::new(coded_width, coded_height, visible_width, visible_height)
+    }
+
+    fn recycle_frame(&mut self, frame: DecodedFrame422P10) {
+        if self.frame_pool.len() < 4 {
+            self.frame_pool.push(frame);
+        }
+    }
+
+    fn take_motion(&mut self, grid: MacroblockGrid) -> Result<MotionField, H264422P10PictureDecodeError> {
+        if let Some(index) = self
+            .motion_pool
+            .iter()
+            .position(|field| field.matches_grid(grid))
+        {
+            let mut field = self.motion_pool.swap_remove(index);
+            field.clear();
+            return Ok(field);
+        }
+        MotionField::new(grid).map_err(|_| {
+            H264422P10PictureDecodeError::Unsupported("invalid macroblock grid")
+        })
+    }
+
+    fn recycle_motion(&mut self, mut field: MotionField) {
+        if self.motion_pool.len() < 4 {
+            field.clear();
+            self.motion_pool.push(field);
         }
     }
 
@@ -116,14 +235,28 @@ impl H264422P10Decoder {
     ) -> Result<Vec<H264422P10Frame>, H264422P10PictureDecodeError> {
         let parsed = self.state.parse_access_unit(access_unit)?;
         validate_original_profile(&parsed, &self.expected)?;
-        let mut frame = DecodedFrame422P10::new(
+        let mut frame = self.take_frame(
             parsed.desc.coded_width as usize,
             parsed.desc.coded_height as usize,
             parsed.desc.visible_region.width as usize,
             parsed.desc.visible_region.height as usize,
         );
-
-        let motion = decode_picture_into_frame(&parsed, &mut frame, &self.decoded)?;
+        frame.scaling = PictureScaling::from_zigzag(
+            &parsed.picture.scaling_list4x4,
+            &parsed.picture.scaling_list8x8,
+        );
+        let grid = parsed_grid(&parsed)?;
+        let mut scratch = match self.scratch.take() {
+            Some(mut scratch) if scratch.matches_grid(grid) => {
+                scratch.clear();
+                scratch
+            }
+            _ => PictureScratch::new(grid)?,
+        };
+        let replacement = self.take_motion(grid)?;
+        let motion =
+            decode_picture_into_frame(&parsed, &mut frame, &self.decoded, &mut scratch, replacement)?;
+        self.scratch = Some(scratch);
         let presentation_index = self.next_presentation_index;
         self.next_presentation_index = self.next_presentation_index.saturating_add(1);
         self.decoded.insert(
@@ -138,16 +271,36 @@ impl H264422P10Decoder {
         let mut outputs = Vec::new();
         for id in update.output_ready {
             let key = picture_key(&id);
-            let picture = self.decoded.get(&key).ok_or(
-                H264422P10PictureDecodeError::MissingDecodedPicture {
-                    frame_num: id.frame_num,
-                    poc: id.poc,
-                },
-            )?;
-            outputs.push(frame_to_output(picture.presentation_index, &picture.frame)?);
+            if update
+                .released
+                .iter()
+                .any(|released| picture_key(released) == key)
+            {
+                let picture = self.decoded.remove(&key).ok_or(
+                    H264422P10PictureDecodeError::MissingDecodedPicture {
+                        frame_num: id.frame_num,
+                        poc: id.poc,
+                    },
+                )?;
+                outputs.push(frame_into_output(
+                    picture.presentation_index,
+                    picture.frame,
+                )?);
+            } else {
+                let picture = self.decoded.get(&key).ok_or(
+                    H264422P10PictureDecodeError::MissingDecodedPicture {
+                        frame_num: id.frame_num,
+                        poc: id.poc,
+                    },
+                )?;
+                outputs.push(frame_to_output(picture.presentation_index, &picture.frame)?);
+            }
         }
         for id in update.released {
-            self.decoded.remove(&picture_key(&id));
+            if let Some(picture) = self.decoded.remove(&picture_key(&id)) {
+                self.recycle_frame(picture.frame);
+                self.recycle_motion(picture.motion);
+            }
         }
         Ok(outputs)
     }
@@ -163,10 +316,16 @@ impl H264422P10Decoder {
                     poc: id.poc,
                 },
             )?;
-            outputs.push(frame_to_output(picture.presentation_index, &picture.frame)?);
+            outputs.push(frame_into_output(
+                picture.presentation_index,
+                picture.frame,
+            )?);
         }
         for id in update.released {
-            self.decoded.remove(&picture_key(&id));
+            if let Some(picture) = self.decoded.remove(&picture_key(&id)) {
+                self.recycle_frame(picture.frame);
+                self.recycle_motion(picture.motion);
+            }
         }
         Ok(outputs)
     }
@@ -189,16 +348,13 @@ fn implicit_bipred_weights(current_poc: i32, poc0: i32, poc1: i32) -> (i32, i32)
 }
 
 fn colocated_motion(
-    decoded: &BTreeMap<(u16, i32), DecodedPicture>,
-    list1: &[H264PictureId],
+    colocated: Option<&MotionField>,
     address: MacroblockAddress,
     block: usize,
 ) -> Option<MotionSample> {
-    let picture = decoded.get(&picture_key(list1.first()?))?;
-    picture
-        .motion
+    colocated?
         .block_motion(address, block, false)
-        .or_else(|| picture.motion.block_motion(address, block, true))
+        .or_else(|| colocated?.block_motion(address, block, true))
 }
 
 fn luma4x4_scan(block_x: usize, block_y: usize) -> usize {
@@ -207,8 +363,7 @@ fn luma4x4_scan(block_x: usize, block_y: usize) -> usize {
 
 fn direct_partition_motion(
     motion_field: &mut MotionField,
-    decoded: &BTreeMap<(u16, i32), DecodedPicture>,
-    list1: &[H264PictureId],
+    colocated_field: Option<&MotionField>,
     address: MacroblockAddress,
     origin_x: usize,
     origin_y: usize,
@@ -219,7 +374,7 @@ fn direct_partition_motion(
         origin_x + width.saturating_sub(1),
         origin_y + height.saturating_sub(1),
     );
-    let colocated = colocated_motion(decoded, list1, address, block);
+    let colocated = colocated_motion(colocated_field, address, block);
     let (l0, l1) =
         motion_field.spatial_direct_at(address, origin_x, origin_y, width, height, colocated)?;
     commit_direct_partition(
@@ -299,14 +454,13 @@ fn commit_direct_partition(
 /// macroblock's A/B/C neighbors. Each 8x8 then applies its own colZero flag.
 fn spatial_direct_inference_subblock(
     motion_field: &mut MotionField,
-    decoded: &BTreeMap<(u16, i32), DecodedPicture>,
-    list1: &[H264PictureId],
+    colocated_field: Option<&MotionField>,
     address: MacroblockAddress,
     subblock: usize,
     base_l0: Option<(MotionVectorQuarterPel, u8)>,
     base_l1: Option<(MotionVectorQuarterPel, u8)>,
 ) -> Result<(BPartitionMotion, u8, u8), H264422P10PictureDecodeError> {
-    let colocated = colocated_motion(decoded, list1, address, inference_colocated_scan(subblock));
+    let colocated = colocated_motion(colocated_field, address, inference_colocated_scan(subblock));
     let col_zero = colocated.is_some_and(|sample| {
         sample.ref_index == 0 && sample.vector.x.abs() <= 1 && sample.vector.y.abs() <= 1
     });
@@ -325,8 +479,7 @@ fn spatial_direct_inference_subblock(
 
 fn direct_macroblock_prediction(
     motion_field: &mut MotionField,
-    decoded: &BTreeMap<(u16, i32), DecodedPicture>,
-    list1: &[H264PictureId],
+    colocated_field: Option<&MotionField>,
     address: MacroblockAddress,
     spatial: bool,
     inference_8x8: bool,
@@ -347,11 +500,35 @@ fn direct_macroblock_prediction(
             ref_l1: 0,
         }; 4];
         let (base_l0, base_l1) = motion_field.spatial_direct_at(address, 0, 0, 4, 4, None)?;
+        let col_zero = std::array::from_fn::<_, 4, _>(|subblock| {
+            colocated_motion(colocated_field, address, inference_colocated_scan(subblock))
+                .is_some_and(|sample| {
+                    sample.ref_index == 0
+                        && sample.vector.x.abs() <= 1
+                        && sample.vector.y.abs() <= 1
+                })
+        });
+        if col_zero.iter().all(|&flag| flag == col_zero[0]) {
+            let (motion, ref_l0, ref_l1) = commit_direct_partition(
+                motion_field,
+                address,
+                0,
+                0,
+                4,
+                4,
+                apply_col_zero(base_l0, col_zero[0]),
+                apply_col_zero(base_l1, col_zero[0]),
+            )?;
+            return Ok(BInterPrediction::Direct16x16(DirectBlock {
+                motion,
+                ref_l0,
+                ref_l1,
+            }));
+        }
         for subblock in 0..4 {
             let (motion, ref_l0, ref_l1) = spatial_direct_inference_subblock(
                 motion_field,
-                decoded,
-                list1,
+                colocated_field,
                 address,
                 subblock,
                 base_l0,
@@ -366,7 +543,7 @@ fn direct_macroblock_prediction(
         return Ok(BInterPrediction::Direct8x8(blocks));
     }
     let (motion, _, _) =
-        direct_partition_motion(motion_field, decoded, list1, address, 0, 0, 4, 4)?;
+        direct_partition_motion(motion_field, colocated_field, address, 0, 0, 4, 4)?;
     Ok(match motion {
         BPartitionMotion::L0(vector) => BInterPrediction::L0Full16x16(vector),
         BPartitionMotion::L1(vector) => BInterPrediction::L1Full16x16(vector),
@@ -380,36 +557,17 @@ fn record_p_motion(
     prediction: &InterPrediction,
     refs: [u8; 4],
 ) -> Result<(), H264422P10PictureDecodeError> {
-    motion_field.clear_l0(address)?;
-    motion_field.clear_l1(address)?;
     match prediction {
         InterPrediction::Full16x16(motion) => {
             motion_field.set_l0(address, *motion, refs[0])?;
         }
-        InterPrediction::Horizontal16x8([first, second]) => {
-            motion_field.set_l0_blocks(address, P_16X8_BLOCKS[0], *first, refs[0])?;
+        InterPrediction::Horizontal16x8([_, second]) => {
             motion_field.set_l0_blocks(address, P_16X8_BLOCKS[1], *second, refs[2])?;
         }
-        InterPrediction::Vertical8x16([first, second]) => {
-            motion_field.set_l0_blocks(address, P_8X16_BLOCKS[0], *first, refs[0])?;
+        InterPrediction::Vertical8x16([_, second]) => {
             motion_field.set_l0_blocks(address, P_8X16_BLOCKS[1], *second, refs[1])?;
         }
-        InterPrediction::SubPartitions(partitions) => {
-            for partition in partitions {
-                let (x, y, width, height) = sub_partition_region(
-                    partition.subblock_index,
-                    partition.sub_partition_index,
-                    partition.shape,
-                );
-                let covered = blocks_covering(x, y, width, height);
-                motion_field.set_l0_blocks(
-                    address,
-                    &covered,
-                    partition.motion,
-                    refs[partition.subblock_index.min(3)],
-                )?;
-            }
-        }
+        InterPrediction::SubPartitions(_) => {}
     }
     Ok(())
 }
@@ -421,8 +579,6 @@ fn record_b_motion(
     refs_l0: [u8; 4],
     refs_l1: [u8; 4],
 ) -> Result<(), H264422P10PictureDecodeError> {
-    motion_field.clear_l0(address)?;
-    motion_field.clear_l1(address)?;
     match prediction {
         BInterPrediction::L0Full16x16(motion) => {
             motion_field.set_l0(address, *motion, refs_l0[0])?;
@@ -434,92 +590,43 @@ fn record_b_motion(
             motion_field.set_l0(address, *l0, refs_l0[0])?;
             motion_field.set_l1(address, *l1, refs_l1[0])?;
         }
-        BInterPrediction::Horizontal16x8([first, second]) => {
-            record_b_partition(
-                motion_field,
-                address,
-                *first,
-                refs_l0[0],
-                refs_l1[0],
-                &TOP_16X8_BLOCKS,
-            )?;
-            record_b_partition(
-                motion_field,
-                address,
-                *second,
-                refs_l0[2],
-                refs_l1[2],
-                &BOTTOM_16X8_BLOCKS,
-            )?;
-        }
-        BInterPrediction::Vertical8x16([first, second]) => {
-            record_b_partition(
-                motion_field,
-                address,
-                *first,
-                refs_l0[0],
-                refs_l1[0],
-                &LEFT_8X16_BLOCKS,
-            )?;
-            record_b_partition(
-                motion_field,
-                address,
-                *second,
-                refs_l0[1],
-                refs_l1[1],
-                &RIGHT_8X16_BLOCKS,
-            )?;
-        }
-        BInterPrediction::SubPartitions(partitions) => {
-            for partition in partitions {
-                let index = partition.subblock_index.min(3);
-                let (x_offset, y_offset, width, height) = partition.region();
-                let blocks = blocks_covering(x_offset, y_offset, width, height);
-                record_b_partition(
-                    motion_field,
-                    address,
-                    partition.motion,
-                    partition.direct_ref_l0.unwrap_or(refs_l0[index]),
-                    partition.direct_ref_l1.unwrap_or(refs_l1[index]),
-                    &blocks,
-                )?;
-            }
-        }
-        BInterPrediction::Direct8x8(blocks) => {
-            for (index, block) in blocks.iter().enumerate() {
-                let covered = blocks_covering((index % 2) * 8, (index / 2) * 8, 8, 8);
-                record_b_partition(
-                    motion_field,
-                    address,
-                    block.motion,
-                    block.ref_l0,
-                    block.ref_l1,
-                    &covered,
-                )?;
-            }
-        }
+        BInterPrediction::Horizontal16x8(_)
+        | BInterPrediction::Vertical8x16(_)
+        | BInterPrediction::SubPartitions(_)
+        | BInterPrediction::Direct16x16(_)
+        | BInterPrediction::Direct8x8(_) => {}
     }
     Ok(())
 }
 
-const TOP_16X8_BLOCKS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-const BOTTOM_16X8_BLOCKS: [usize; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
-const LEFT_8X16_BLOCKS: [usize; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
-const RIGHT_8X16_BLOCKS: [usize; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
+struct CoveredBlocks {
+    values: [usize; 16],
+    len: usize,
+}
 
-fn blocks_covering(x: usize, y: usize, width: usize, height: usize) -> Vec<usize> {
-    let mut blocks = Vec::new();
+impl std::ops::Deref for CoveredBlocks {
+    type Target = [usize];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values[..self.len]
+    }
+}
+
+fn blocks_covering(x: usize, y: usize, width: usize, height: usize) -> CoveredBlocks {
+    let mut blocks = CoveredBlocks {
+        values: [0; 16],
+        len: 0,
+    };
     let x_end = x.saturating_add(width);
     let y_end = y.saturating_add(height);
     for block_y in (y / 4)..y_end.div_ceil(4) {
         for block_x in (x / 4)..x_end.div_ceil(4) {
             if block_x < 4 && block_y < 4 {
-                blocks.push(
-                    ((block_y & 1) << 1)
-                        | (block_x & 1)
-                        | ((block_x & 2) << 1)
-                        | ((block_y & 2) << 2),
-                );
+                blocks.values[blocks.len] = ((block_y & 1) << 1)
+                    | (block_x & 1)
+                    | ((block_x & 2) << 1)
+                    | ((block_y & 2) << 2);
+                blocks.len += 1;
             }
         }
     }
@@ -549,23 +656,34 @@ fn record_b_partition(
     Ok(())
 }
 
-fn list_frame<'a>(
+fn resolve_reference_frames<'a>(
     decoded: &'a BTreeMap<(u16, i32), DecodedPicture>,
-    list: &[H264PictureId],
+    ids: &[H264PictureId],
+) -> Result<SmallVec<[&'a DecodedFrame422P10; 4]>, H264422P10PictureDecodeError> {
+    ids.iter()
+        .map(|id| {
+            decoded
+                .get(&picture_key(id))
+                .map(|picture| &picture.frame)
+                .ok_or(H264422P10PictureDecodeError::MissingDecodedPicture {
+                    frame_num: id.frame_num,
+                    poc: id.poc,
+                })
+        })
+        .collect()
+}
+
+#[inline]
+fn resolved_frame<'a>(
+    frames: &[&'a DecodedFrame422P10],
     index: u8,
 ) -> Result<&'a DecodedFrame422P10, H264422P10PictureDecodeError> {
-    let id = list
+    frames
         .get(usize::from(index))
+        .copied()
         .ok_or(H264422P10PictureDecodeError::Unsupported(
-            "reference index exceeds the picture list",
-        ))?;
-    decoded
-        .get(&picture_key(id))
-        .map(|picture| &picture.frame)
-        .ok_or(H264422P10PictureDecodeError::MissingDecodedPicture {
-            frame_num: id.frame_num,
-            poc: id.poc,
-        })
+            "reference index exceeds the resolved picture list",
+        ))
 }
 
 fn parsed_grid(
@@ -579,7 +697,12 @@ fn decode_picture_into_frame(
     parsed: &ParsedH264AccessUnit,
     frame: &mut DecodedFrame422P10,
     decoded: &BTreeMap<(u16, i32), DecodedPicture>,
+    scratch: &mut PictureScratch,
+    replacement: MotionField,
 ) -> Result<MotionField, H264422P10PictureDecodeError> {
+    let profile_start = std::env::var_os("QGS_PROFILE_DECODER")
+        .is_some()
+        .then(std::time::Instant::now);
     if parsed.slices.is_empty() {
         return Err(H264422P10PictureDecodeError::Unsupported(
             "picture has no slices",
@@ -592,14 +715,6 @@ fn decode_picture_into_frame(
     }
 
     let grid = parsed_grid(parsed)?;
-    let mut motion_field = MotionField::new(grid)?;
-    let mut mvd_syntax = MvdSyntaxField::new(grid)?;
-    let mut intra16_or_pcm = vec![None; grid.macroblock_count() as usize];
-    let mut chroma_pred_modes = vec![None; grid.macroblock_count() as usize];
-    let mut intra_luma_prediction_modes = vec![None; grid.macroblock_count() as usize];
-    let mut coded_block_patterns = vec![0_u8; grid.macroblock_count() as usize];
-    let mut transform_size_8x8_flags = vec![false; grid.macroblock_count() as usize];
-    let mut skip_flags = vec![false; grid.macroblock_count() as usize];
     let mut reconstructed_macroblocks = 0_u32;
     let mut slice_reports = Vec::new();
     let mut deblock = DeblockGrid::new(grid.width_in_mbs, grid.height_in_mbs);
@@ -621,12 +736,12 @@ fn decode_picture_into_frame(
                 slice,
                 expected_slice_macroblocks,
                 frame,
-                &mut motion_field,
-                &mut intra16_or_pcm,
-                &mut chroma_pred_modes,
-                &mut intra_luma_prediction_modes,
-                &mut coded_block_patterns,
-                &mut transform_size_8x8_flags,
+                &mut scratch.motion_field,
+                &mut scratch.intra16_or_pcm,
+                &mut scratch.chroma_pred_modes,
+                &mut scratch.intra_luma_prediction_modes,
+                &mut scratch.coded_block_patterns,
+                &mut scratch.transform_size_8x8_flags,
                 &mut deblock,
                 slice_id,
             )?,
@@ -636,13 +751,15 @@ fn decode_picture_into_frame(
                 expected_slice_macroblocks,
                 frame,
                 decoded,
-                &mut motion_field,
-                &mut mvd_syntax,
-                &mut skip_flags,
-                &mut intra16_or_pcm,
-                &mut chroma_pred_modes,
-                &mut intra_luma_prediction_modes,
-                &mut coded_block_patterns,
+                &mut scratch.motion_field,
+                &mut scratch.mvd_syntax,
+                &mut scratch.skip_flags,
+                &mut scratch.intra16_or_pcm,
+                &mut scratch.chroma_pred_modes,
+                &mut scratch.intra_luma_prediction_modes,
+                &mut scratch.coded_block_patterns,
+                &mut scratch.transform_size_8x8_flags,
+                &mut scratch.ref_idx_l0,
                 &mut deblock,
                 slice_id,
             )?,
@@ -652,13 +769,17 @@ fn decode_picture_into_frame(
                 expected_slice_macroblocks,
                 frame,
                 decoded,
-                &mut motion_field,
-                &mut mvd_syntax,
-                &mut skip_flags,
-                &mut intra16_or_pcm,
-                &mut chroma_pred_modes,
-                &mut intra_luma_prediction_modes,
-                &mut coded_block_patterns,
+                &mut scratch.motion_field,
+                &mut scratch.mvd_syntax,
+                &mut scratch.skip_flags,
+                &mut scratch.intra16_or_pcm,
+                &mut scratch.chroma_pred_modes,
+                &mut scratch.intra_luma_prediction_modes,
+                &mut scratch.coded_block_patterns,
+                &mut scratch.transform_size_8x8_flags,
+                &mut scratch.direct_flags,
+                &mut scratch.ref_idx_l0,
+                &mut scratch.ref_idx_l1,
                 &mut deblock,
                 slice_id,
             )?,
@@ -691,8 +812,17 @@ fn decode_picture_into_frame(
             slice_reports,
         });
     }
-    deblock.apply(frame, &motion_field);
-    Ok(motion_field)
+    let deblock_start = profile_start.map(|_| std::time::Instant::now());
+    deblock.apply(frame, &scratch.motion_field);
+    if let (Some(start), Some(deblock_start)) = (profile_start, deblock_start) {
+        let kind = parsed.slices.first().map(|slice| &slice.kind);
+        eprintln!(
+            "QGS_PROFILE kind={kind:?} decode_us={} deblock_us={}",
+            deblock_start.duration_since(start).as_micros(),
+            deblock_start.elapsed().as_micros(),
+        );
+    }
+    Ok(std::mem::replace(&mut scratch.motion_field, replacement))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -727,8 +857,10 @@ struct MvdSyntaxField {
     width_in_mbs: u32,
     height_in_mbs: u32,
     slice_first_mb: u32,
-    l0: Vec<[Option<MotionVectorQuarterPel>; 16]>,
-    l1: Vec<[Option<MotionVectorQuarterPel>; 16]>,
+    l0: Vec<[MotionVectorQuarterPel; 16]>,
+    l1: Vec<[MotionVectorQuarterPel; 16]>,
+    l0_present: Vec<u16>,
+    l1_present: Vec<u16>,
 }
 
 impl MvdSyntaxField {
@@ -740,13 +872,25 @@ impl MvdSyntaxField {
             width_in_mbs: grid.width_in_mbs,
             height_in_mbs: grid.height_in_mbs,
             slice_first_mb: 0,
-            l0: vec![[None; 16]; count],
-            l1: vec![[None; 16]; count],
+            l0: vec![[MotionVectorQuarterPel::ZERO; 16]; count],
+            l1: vec![[MotionVectorQuarterPel::ZERO; 16]; count],
+            l0_present: vec![0; count],
+            l1_present: vec![0; count],
         })
     }
 
     fn set_slice_first_mb(&mut self, slice_first_mb: u32) {
         self.slice_first_mb = slice_first_mb;
+    }
+
+    fn matches_grid(&self, grid: MacroblockGrid) -> bool {
+        self.width_in_mbs == grid.width_in_mbs && self.height_in_mbs == grid.height_in_mbs
+    }
+
+    fn clear(&mut self) {
+        self.l0_present.fill(0);
+        self.l1_present.fill(0);
+        self.slice_first_mb = 0;
     }
 
     fn context_indices(
@@ -755,10 +899,40 @@ impl MvdSyntaxField {
         block_index: usize,
         list: MotionList,
     ) -> (usize, usize) {
-        let (left, top) = (
-            self.neighbor_mvd(address, block_index, list, -1, 0),
-            self.neighbor_mvd(address, block_index, list, 0, -1),
-        );
+        let (block_x, block_y) = luma4x4_position(block_index);
+        let (source, present) = match list {
+            MotionList::L0 => (&self.l0, &self.l0_present),
+            MotionList::L1 => (&self.l1, &self.l1_present),
+        };
+        let first_mb = self.slice_first_mb as usize;
+        let sample = |mb_x: u32, mb_y: u32, x: usize, y: usize| {
+            if mb_x >= self.width_in_mbs || mb_y >= self.height_in_mbs {
+                return None;
+            }
+            let mb = (mb_y as usize) * (self.width_in_mbs as usize) + mb_x as usize;
+            if mb < first_mb {
+                return None;
+            }
+            let index = luma4x4_index(x, y);
+            if present.get(mb).copied().unwrap_or(0) & (1_u16 << index) == 0 {
+                return None;
+            }
+            Some(source[mb][index])
+        };
+        let left = if block_x != 0 {
+            sample(address.x, address.y, block_x - 1, block_y)
+        } else if address.x != 0 {
+            sample(address.x - 1, address.y, 3, block_y)
+        } else {
+            None
+        };
+        let top = if block_y != 0 {
+            sample(address.x, address.y, block_x, block_y - 1)
+        } else if address.y != 0 {
+            sample(address.x, address.y - 1, block_x, 3)
+        } else {
+            None
+        };
         (
             mvd_context_index(left.map(|mvd| mvd.x), top.map(|mvd| mvd.x)),
             mvd_context_index(left.map(|mvd| mvd.y), top.map(|mvd| mvd.y)),
@@ -772,16 +946,21 @@ impl MvdSyntaxField {
         list: MotionList,
         mvd: MotionVectorQuarterPel,
     ) {
-        let target = match list {
-            MotionList::L0 => &mut self.l0,
-            MotionList::L1 => &mut self.l1,
+        let mb = address.address as usize;
+        let (target, present) = match list {
+            MotionList::L0 => (&mut self.l0, &mut self.l0_present),
+            MotionList::L1 => (&mut self.l1, &mut self.l1_present),
         };
-        let Some(macroblock) = target.get_mut(address.address as usize) else {
+        let Some(macroblock) = target.get_mut(mb) else {
+            return;
+        };
+        let Some(mask) = present.get_mut(mb) else {
             return;
         };
         for &block in blocks {
             if let Some(slot) = macroblock.get_mut(block) {
-                *slot = Some(mvd);
+                *slot = mvd;
+                *mask |= 1_u16 << block;
             }
         }
     }
@@ -791,74 +970,13 @@ impl MvdSyntaxField {
     }
 
     fn mark_intra(&mut self, address: MacroblockAddress) {
-        if let Some(macroblock) = self.l0.get_mut(address.address as usize) {
-            *macroblock = [None; 16];
+        let mb = address.address as usize;
+        if let Some(mask) = self.l0_present.get_mut(mb) {
+            *mask = 0;
         }
-        if let Some(macroblock) = self.l1.get_mut(address.address as usize) {
-            *macroblock = [None; 16];
+        if let Some(mask) = self.l1_present.get_mut(mb) {
+            *mask = 0;
         }
-    }
-
-    fn neighbor_mvd(
-        &self,
-        address: MacroblockAddress,
-        block_index: usize,
-        list: MotionList,
-        dx: i32,
-        dy: i32,
-    ) -> Option<MotionVectorQuarterPel> {
-        let (block_x, block_y) = luma4x4_position(block_index);
-        let block_x = i32::try_from(block_x).ok()?;
-        let block_y = i32::try_from(block_y).ok()?;
-        let mut macroblock_x = i32::try_from(address.x).ok()?;
-        let mut macroblock_y = i32::try_from(address.y).ok()?;
-        let mut neighbor_block_x = block_x + dx;
-        let mut neighbor_block_y = block_y + dy;
-
-        if neighbor_block_x < 0 {
-            macroblock_x -= 1;
-            neighbor_block_x = 3;
-        } else if neighbor_block_x >= 4 {
-            macroblock_x += 1;
-            neighbor_block_x = 0;
-        }
-        if neighbor_block_y < 0 {
-            macroblock_y -= 1;
-            neighbor_block_y = 3;
-        } else if neighbor_block_y >= 4 {
-            macroblock_y += 1;
-            neighbor_block_y = 0;
-        }
-        if macroblock_x < 0
-            || macroblock_y < 0
-            || macroblock_x >= i32::try_from(self.width_in_mbs).ok()?
-            || macroblock_y >= i32::try_from(self.height_in_mbs).ok()?
-        {
-            return None;
-        }
-        let macroblock_index = usize::try_from(
-            u32::try_from(macroblock_y)
-                .ok()?
-                .saturating_mul(self.width_in_mbs)
-                .saturating_add(u32::try_from(macroblock_x).ok()?),
-        )
-        .ok()?;
-        if macroblock_index < self.slice_first_mb as usize {
-            return None;
-        }
-        let neighbor_block_index = luma4x4_index(
-            usize::try_from(neighbor_block_x).ok()?,
-            usize::try_from(neighbor_block_y).ok()?,
-        );
-        let source = match list {
-            MotionList::L0 => &self.l0,
-            MotionList::L1 => &self.l1,
-        };
-        source
-            .get(macroblock_index)
-            .and_then(|macroblock| macroblock.get(neighbor_block_index))
-            .copied()
-            .flatten()
     }
 }
 
@@ -1027,15 +1145,18 @@ fn decode_p_slice_into_frame(
     chroma_pred_modes: &mut [Option<u8>],
     intra_luma_prediction_modes: &mut [Option<[Intra4x4PredictionMode; 16]>],
     coded_block_patterns: &mut [u8],
+    mut transform_size_8x8_flags: &mut [bool],
+    mut ref_idx_l0: &mut [[u8; 4]],
     deblock: &mut DeblockGrid,
     slice_id: u16,
 ) -> Result<SliceDecodeProgress, H264422P10PictureDecodeError> {
+    frame.slice_first_mb = u32::from(slice.first_mb_in_slice);
     if slice.ref_pic_list0.is_empty() {
         return Err(H264422P10PictureDecodeError::Unsupported(
             "P slice has no L0 reference picture",
         ));
     }
-    let _ = list_frame(decoded, &slice.ref_pic_list0, 0)?;
+    let resolved_l0 = resolve_reference_frames(decoded, &slice.ref_pic_list0)?;
     let payload = slice_payload_from_parsed(parsed, slice)?;
     let payload = payload.cabac_payload_bytes()?;
     let cabac_payload_bits = payload.len().saturating_mul(8);
@@ -1075,9 +1196,8 @@ fn decode_p_slice_into_frame(
     let mut transform_size_8x8_contexts =
         pb_slice_transform_size_8x8_contexts(slice.cabac_init_idc, qp_y);
     let grid = parsed_grid(parsed)?;
+    motion_field.set_slice_first_mb(u32::from(slice.first_mb_in_slice));
     mvd_syntax.set_slice_first_mb(u32::from(slice.first_mb_in_slice));
-    let mut transform_size_8x8_flags = vec![false; grid.macroblock_count() as usize];
-    let mut ref_idx_l0 = vec![[0u8; 4]; grid.macroblock_count() as usize];
     let mut ref_idx_contexts: [CabacContext; 6] =
         std::array::from_fn(|index| pb_table_context(slice.cabac_init_idc, 54 + index, qp_y));
     let mut residual_decoder_422 =
@@ -1091,13 +1211,14 @@ fn decode_p_slice_into_frame(
     let mut last_macroblock_type = "none";
     let mut last_coded_block_pattern = None;
     let mut cabac_bit_position = None;
+    let mut reconstruction_plan = SonySlicePlan::with_capacity(expected_slice_macroblocks as usize);
+    let empty_l1: &[&DecodedFrame422P10] = &[];
 
     while count < expected_slice_macroblocks {
         let Some(address) = cursor.next_macroblock() else {
             break;
         };
         residual_decoder_422.set_current_macroblock_intra(false);
-        let predicted_motion = motion_field.predict_p_skip(address)?;
         let skip_context_index = inter_skip_context_index(
             address,
             grid.width_in_mbs,
@@ -1106,6 +1227,7 @@ fn decode_p_slice_into_frame(
         );
         let skipped = cabac.decode_decision(&mut skip_contexts[skip_context_index])?;
         let (prediction, luma_residuals, chroma_residuals) = if skipped {
+            let predicted_motion = motion_field.predict_p_skip(address)?;
             last_macroblock_type = "P_Skip";
             last_coded_block_pattern = Some(0);
             last_qscale_diff_nonzero = false;
@@ -1184,6 +1306,8 @@ fn decode_p_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut p_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -1193,6 +1317,7 @@ fn decode_p_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         InterPrediction::Full16x16(motion),
@@ -1288,6 +1413,8 @@ fn decode_p_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut p_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -1297,6 +1424,7 @@ fn decode_p_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         InterPrediction::Horizontal16x8([first, second]),
@@ -1392,6 +1520,8 @@ fn decode_p_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut p_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -1401,6 +1531,7 @@ fn decode_p_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         InterPrediction::Vertical8x16([first, second]),
@@ -1483,6 +1614,8 @@ fn decode_p_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut p_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -1492,6 +1625,7 @@ fn decode_p_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         InterPrediction::SubPartitions(partitions),
@@ -1500,6 +1634,12 @@ fn decode_p_slice_into_frame(
                     )
                 }
                 PSliceMacroblockType::Intra(intra) => {
+                    execute_sony_slice_plan(
+                        &mut reconstruction_plan,
+                        &resolved_l0,
+                        empty_l1,
+                        frame,
+                    )?;
                     residual_decoder_422.set_current_macroblock_intra(true);
                     let chroma_context = if !matches!(intra, ISliceMacroblockType::Pcm) {
                         Some(intra_chroma_pred_mode_context(
@@ -1607,51 +1747,101 @@ fn decode_p_slice_into_frame(
             .get(address.address as usize)
             .copied()
             .unwrap_or([0; 4]);
-        prediction.copy_from_reference(decoded, &slice.ref_pic_list0, refs, frame, address)?;
-        match luma_residuals {
-            InterLumaResidual::Absent => {}
-            InterLumaResidual::Blocks4x4(residuals) => {
-                if !add_luma_residual_16x16(
-                    frame,
-                    address.x as usize,
-                    address.y as usize,
-                    reconstruction_qp_from_qpy(current_qp_y),
-                    &residuals,
-                ) {
-                    return Err(MacroblockReconstructionError::OutOfBounds.into());
-                }
+        let qp_y = reconstruction_qp_from_qpy(current_qp_y);
+        let qp_cb = chroma_qp_prime(current_qp_y, parsed.picture.chroma_qp_index_offset);
+        let qp_cr = chroma_qp_prime(current_qp_y, parsed.picture.second_chroma_qp_index_offset);
+        match &prediction {
+            InterPrediction::Full16x16(motion)
+                if matches!(luma_residuals, InterLumaResidual::Absent)
+                    && chroma_residuals.is_none() =>
+            {
+                reconstruction_plan.commands.push(PlanCommand {
+                    address,
+                    kernel: PlanKernel::L0 {
+                        motion: *motion,
+                        reference: refs[0],
+                    },
+                    luma: PlanLumaResidual::Absent,
+                    chroma: None,
+                    qp_y,
+                    qp_cb,
+                    qp_cr,
+                });
             }
-            InterLumaResidual::Blocks8x8(residuals) => {
-                if !add_luma_residual_8x8(
+            InterPrediction::Full16x16(_)
+            | InterPrediction::Horizontal16x8(_)
+            | InterPrediction::Vertical8x16(_) => {
+                execute_p_inter_fused(
+                    &prediction,
+                    &resolved_l0,
+                    refs,
                     frame,
-                    address.x as usize,
-                    address.y as usize,
-                    reconstruction_qp_from_qpy(current_qp_y),
-                    &residuals,
-                ) {
-                    return Err(MacroblockReconstructionError::OutOfBounds.into());
-                }
+                    address,
+                    luma_residuals,
+                    chroma_residuals,
+                    qp_y,
+                    qp_cb,
+                    qp_cr,
+                )?;
             }
-        }
-        if let Some((cb, cr)) = chroma_residuals {
-            let qp_cb = chroma_qp_prime(current_qp_y, parsed.picture.chroma_qp_index_offset);
-            let qp_cr = chroma_qp_prime(current_qp_y, parsed.picture.second_chroma_qp_index_offset);
-            if !add_chroma_residual_422_prescaled(
-                frame,
-                ChromaPlane::Cb,
-                address.x as usize,
-                address.y as usize,
-                qp_cb,
-                &cb,
-            ) || !add_chroma_residual_422_prescaled(
-                frame,
-                ChromaPlane::Cr,
-                address.x as usize,
-                address.y as usize,
-                qp_cr,
-                &cr,
-            ) {
-                return Err(MacroblockReconstructionError::OutOfBounds.into());
+            InterPrediction::SubPartitions(_) => {
+                prediction.copy_from_reference(&resolved_l0, refs, frame, address)?;
+                match luma_residuals {
+                    InterLumaResidual::Absent => {}
+                    InterLumaResidual::Blocks4x4(residuals) => {
+                        if !add_luma_residual_16x16(
+                            frame,
+                            address.x as usize,
+                            address.y as usize,
+                            qp_y,
+                            &residuals,
+                        ) {
+                            return Err(MacroblockReconstructionError::OutOfBounds.into());
+                        }
+                    }
+                    InterLumaResidual::Blocks4x4Dequantized(residuals) => {
+                        if !add_luma_residual_16x16_predequantized(
+                            frame,
+                            address.x as usize,
+                            address.y as usize,
+                            &residuals,
+                        ) {
+                            return Err(MacroblockReconstructionError::OutOfBounds.into());
+                        }
+                    }
+                    InterLumaResidual::Blocks8x8(residuals) => {
+                        if !add_luma_residual_8x8(
+                            frame,
+                            address.x as usize,
+                            address.y as usize,
+                            qp_y,
+                            &residuals,
+                        ) {
+                            return Err(MacroblockReconstructionError::OutOfBounds.into());
+                        }
+                    }
+                }
+                if let Some((cb, cr)) = chroma_residuals {
+                    if !add_chroma_residual_422_prescaled(
+                        frame,
+                        ChromaPlane::Cb,
+                        address.x as usize,
+                        address.y as usize,
+                        qp_cb,
+                        &cb,
+                        false,
+                    ) || !add_chroma_residual_422_prescaled(
+                        frame,
+                        ChromaPlane::Cr,
+                        address.x as usize,
+                        address.y as usize,
+                        qp_cr,
+                        &cr,
+                        false,
+                    ) {
+                        return Err(MacroblockReconstructionError::OutOfBounds.into());
+                    }
+                }
             }
         }
         record_p_motion(motion_field, address, &prediction, refs)?;
@@ -1697,6 +1887,7 @@ fn decode_p_slice_into_frame(
             break;
         }
     }
+    execute_sony_slice_plan(&mut reconstruction_plan, &resolved_l0, empty_l1, frame)?;
     if count == expected_slice_macroblocks && stop_reason == "slice-cursor-ended" {
         stop_reason = "expected-slice-end-without-terminate";
     }
@@ -1724,9 +1915,14 @@ fn decode_b_slice_into_frame(
     chroma_pred_modes: &mut [Option<u8>],
     intra_luma_prediction_modes: &mut [Option<[Intra4x4PredictionMode; 16]>],
     coded_block_patterns: &mut [u8],
+    mut transform_size_8x8_flags: &mut [bool],
+    direct_flags: &mut [bool],
+    mut ref_idx_l0: &mut [[u8; 4]],
+    mut ref_idx_l1: &mut [[u8; 4]],
     deblock: &mut DeblockGrid,
     slice_id: u16,
 ) -> Result<SliceDecodeProgress, H264422P10PictureDecodeError> {
+    frame.slice_first_mb = u32::from(slice.first_mb_in_slice);
     if slice.ref_pic_list0.is_empty() {
         return Err(H264422P10PictureDecodeError::Unsupported(
             "B slice has no L0 reference picture",
@@ -1737,8 +1933,13 @@ fn decode_b_slice_into_frame(
             "B slice has no L1 reference picture",
         ));
     }
-    let _ = list_frame(decoded, &slice.ref_pic_list0, 0)?;
-    let _ = list_frame(decoded, &slice.ref_pic_list1, 0)?;
+    let resolved_l0 = resolve_reference_frames(decoded, &slice.ref_pic_list0)?;
+    let resolved_l1 = resolve_reference_frames(decoded, &slice.ref_pic_list1)?;
+    let colocated_field = slice
+        .ref_pic_list1
+        .first()
+        .and_then(|id| decoded.get(&picture_key(id)))
+        .map(|picture| &picture.motion);
     let payload = slice_payload_from_parsed(parsed, slice)?;
     let payload = payload.cabac_payload_bytes()?;
     let cabac_payload_bits = payload.len().saturating_mul(8);
@@ -1775,11 +1976,8 @@ fn decode_b_slice_into_frame(
     let mut transform_size_8x8_contexts =
         pb_slice_transform_size_8x8_contexts(slice.cabac_init_idc, qp_y);
     let grid = parsed_grid(parsed)?;
+    motion_field.set_slice_first_mb(u32::from(slice.first_mb_in_slice));
     mvd_syntax.set_slice_first_mb(u32::from(slice.first_mb_in_slice));
-    let mut transform_size_8x8_flags = vec![false; grid.macroblock_count() as usize];
-    let mut direct_flags = vec![false; grid.macroblock_count() as usize];
-    let mut ref_idx_l0 = vec![[0u8; 4]; grid.macroblock_count() as usize];
-    let mut ref_idx_l1 = vec![[0u8; 4]; grid.macroblock_count() as usize];
     let mut ref_idx_contexts: [CabacContext; 6] =
         std::array::from_fn(|index| pb_table_context(slice.cabac_init_idc, 54 + index, qp_y));
     let mut residual_decoder_422 =
@@ -1791,6 +1989,7 @@ fn decode_b_slice_into_frame(
     };
     let mut cursor = SliceMacroblockCursor::new(parsed, slice)?;
     let mut count = 0_u32;
+    let mut reconstruction_plan = SonySlicePlan::with_capacity(expected_slice_macroblocks as usize);
     let mut stop_reason = "slice-cursor-ended";
     let mut last_macroblock = None;
     let mut last_macroblock_type = "none";
@@ -1820,8 +2019,7 @@ fn decode_b_slice_into_frame(
             (
                 direct_macroblock_prediction(
                     motion_field,
-                    decoded,
-                    &slice.ref_pic_list1,
+                    colocated_field,
                     address,
                     slice.direct_spatial_mv_pred_flag != 0,
                     parsed.picture.direct_8x8_inference_flag,
@@ -1881,6 +2079,8 @@ fn decode_b_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut b_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -1890,12 +2090,12 @@ fn decode_b_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         direct_macroblock_prediction(
                             motion_field,
-                            decoded,
-                            &slice.ref_pic_list1,
+                            colocated_field,
                             address,
                             slice.direct_spatial_mv_pred_flag != 0,
                             parsed.picture.direct_8x8_inference_flag,
@@ -1975,6 +2175,8 @@ fn decode_b_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut b_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -1984,6 +2186,7 @@ fn decode_b_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (prediction, luma_residuals, chroma_residuals)
                 }
@@ -2065,6 +2268,8 @@ fn decode_b_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut b_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -2074,6 +2279,7 @@ fn decode_b_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         BInterPrediction::Horizontal16x8([first, second]),
@@ -2159,6 +2365,8 @@ fn decode_b_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut b_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -2168,6 +2376,7 @@ fn decode_b_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         BInterPrediction::Vertical8x16([first, second]),
@@ -2176,6 +2385,12 @@ fn decode_b_slice_into_frame(
                     )
                 }
                 BSliceMacroblockType::Intra(intra) => {
+                    execute_sony_slice_plan(
+                        &mut reconstruction_plan,
+                        &resolved_l0,
+                        &resolved_l1,
+                        frame,
+                    )?;
                     residual_decoder_422.set_current_macroblock_intra(true);
                     let chroma_context = if !matches!(intra, ISliceMacroblockType::Pcm) {
                         Some(intra_chroma_pred_mode_context(
@@ -2299,8 +2514,7 @@ fn decode_b_slice_into_frame(
                             }
                             let (motion, ref_l0, ref_l1) = spatial_direct_inference_subblock(
                                 motion_field,
-                                decoded,
-                                &slice.ref_pic_list1,
+                                colocated_field,
                                 address,
                                 subblock_index,
                                 base_l0,
@@ -2384,6 +2598,8 @@ fn decode_b_slice_into_frame(
                         &mut transform_size_8x8_flags,
                         &mut residual_decoder_422,
                         &mut b_luma8x8_residual_contexts,
+                        reconstruction_qp_from_qpy(current_qp_y),
+                        &frame.scaling,
                     )?;
                     let chroma_residuals = decode_chroma_residual_blocks_422(
                         &mut cabac,
@@ -2393,6 +2609,7 @@ fn decode_b_slice_into_frame(
                         current_qp_y,
                         parsed.picture.chroma_qp_index_offset,
                         parsed.picture.second_chroma_qp_index_offset,
+                        &frame.scaling,
                     )?;
                     (
                         BInterPrediction::SubPartitions(partitions),
@@ -2410,64 +2627,90 @@ fn decode_b_slice_into_frame(
             .get(address.address as usize)
             .copied()
             .unwrap_or([0; 4]);
-        prediction.clone().copy_from_references(
-            decoded,
-            &slice.ref_pic_list0,
-            &slice.ref_pic_list1,
+        record_b_motion(motion_field, address, &prediction, refs_l0, refs_l1)?;
+        let qp_y = reconstruction_qp_from_qpy(current_qp_y);
+        let qp_cb = chroma_qp_prime(current_qp_y, parsed.picture.chroma_qp_index_offset);
+        let qp_cr = chroma_qp_prime(current_qp_y, parsed.picture.second_chroma_qp_index_offset);
+        if matches!(luma_residuals, InterLumaResidual::Absent) && chroma_residuals.is_none() {
+            if let Some(kernel) = b_plan_kernel(
+                &prediction,
+                refs_l0,
+                refs_l1,
+                &slice.ref_pic_list0,
+                &slice.ref_pic_list1,
+                parsed.picture.top_field_order_cnt,
+                parsed.picture.weighted_bipred_idc == 2,
+            ) {
+                reconstruction_plan.commands.push(PlanCommand {
+                    address,
+                    kernel,
+                    luma: PlanLumaResidual::Absent,
+                    chroma: None,
+                    qp_y,
+                    qp_cb,
+                    qp_cr,
+                });
+            } else {
+                prediction.copy_from_references(
+                    &resolved_l0,
+                    &resolved_l1,
+                    &slice.ref_pic_list0,
+                    &slice.ref_pic_list1,
+                    refs_l0,
+                    refs_l1,
+                    frame,
+                    address,
+                    parsed.picture.top_field_order_cnt,
+                    parsed.picture.weighted_bipred_idc == 2,
+                )?;
+            }
+        } else if let Some(command) = SonyBInterCommand::new(
+            &prediction,
             refs_l0,
             refs_l1,
-            frame,
             address,
+            &slice.ref_pic_list0,
+            &slice.ref_pic_list1,
             parsed.picture.top_field_order_cnt,
             parsed.picture.weighted_bipred_idc == 2,
-        )?;
-        match luma_residuals {
-            InterLumaResidual::Absent => {}
-            InterLumaResidual::Blocks4x4(residuals) => {
-                if !add_luma_residual_16x16(
-                    frame,
-                    address.x as usize,
-                    address.y as usize,
-                    reconstruction_qp_from_qpy(current_qp_y),
-                    &residuals,
-                ) {
-                    return Err(MacroblockReconstructionError::OutOfBounds.into());
-                }
-            }
-            InterLumaResidual::Blocks8x8(residuals) => {
-                if !add_luma_residual_8x8(
-                    frame,
-                    address.x as usize,
-                    address.y as usize,
-                    reconstruction_qp_from_qpy(current_qp_y),
-                    &residuals,
-                ) {
-                    return Err(MacroblockReconstructionError::OutOfBounds.into());
-                }
-            }
-        }
-        if let Some((cb, cr)) = chroma_residuals {
-            let qp_cb = chroma_qp_prime(current_qp_y, parsed.picture.chroma_qp_index_offset);
-            let qp_cr = chroma_qp_prime(current_qp_y, parsed.picture.second_chroma_qp_index_offset);
-            if !add_chroma_residual_422_prescaled(
+        ) {
+            command.execute_fused(
+                &resolved_l0,
+                &resolved_l1,
                 frame,
-                ChromaPlane::Cb,
-                address.x as usize,
-                address.y as usize,
-                qp_cb,
-                &cb,
-            ) || !add_chroma_residual_422_prescaled(
+                SonyBResidual {
+                    luma: luma_residuals,
+                    chroma: chroma_residuals,
+                    qp_y,
+                    qp_cb,
+                    qp_cr,
+                },
+            )?;
+        } else {
+            prediction.copy_from_references(
+                &resolved_l0,
+                &resolved_l1,
+                &slice.ref_pic_list0,
+                &slice.ref_pic_list1,
+                refs_l0,
+                refs_l1,
                 frame,
-                ChromaPlane::Cr,
-                address.x as usize,
-                address.y as usize,
-                qp_cr,
-                &cr,
-            ) {
-                return Err(MacroblockReconstructionError::OutOfBounds.into());
-            }
+                address,
+                parsed.picture.top_field_order_cnt,
+                parsed.picture.weighted_bipred_idc == 2,
+            )?;
+            apply_sony_b_residual(
+                frame,
+                address,
+                SonyBResidual {
+                    luma: luma_residuals,
+                    chroma: chroma_residuals,
+                    qp_y,
+                    qp_cb,
+                    qp_cr,
+                },
+            )?;
         }
-        record_b_motion(motion_field, address, &prediction, refs_l0, refs_l1)?;
         if skipped || matches!(last_macroblock_type, "B_Direct16x16") {
             mvd_syntax.mark_zero(address, &ALL_16X16_BLOCKS, MotionList::L0);
             mvd_syntax.mark_zero(address, &ALL_16X16_BLOCKS, MotionList::L1);
@@ -2514,6 +2757,7 @@ fn decode_b_slice_into_frame(
             break;
         }
     }
+    execute_sony_slice_plan(&mut reconstruction_plan, &resolved_l0, &resolved_l1, frame)?;
     if count == expected_slice_macroblocks && stop_reason == "slice-cursor-ended" {
         stop_reason = "expected-slice-end-without-terminate";
     }
@@ -2880,9 +3124,9 @@ fn decode_b_sub_macroblock_partitions_ordered(
     address: MacroblockAddress,
     cabac: &mut CabacDecoder<'_>,
     mvd_contexts: &mut CabacMotionVectorContexts,
-) -> Result<Vec<BSubPartition>, H264422P10PictureDecodeError> {
-    let mut pending = Vec::new();
-    let mut partitions = Vec::new();
+) -> Result<SmallVec<[BSubPartition; 16]>, H264422P10PictureDecodeError> {
+    let mut pending = SmallVec::<[BSubPartitionPending; 16]>::new();
+    let mut partitions = SmallVec::<[BSubPartition; 16]>::new();
 
     for (subblock_index, sub_type) in sub_types.into_iter().enumerate() {
         match sub_type {
@@ -2897,6 +3141,16 @@ fn decode_b_sub_macroblock_partitions_ordered(
                     0,
                     0,
                 ));
+                if direct_motions[subblock_index].is_none() {
+                    record_b_partition(
+                        motion_field,
+                        address,
+                        motion,
+                        ref_l0,
+                        ref_l1,
+                        B_8X8_BLOCKS[subblock_index],
+                    )?;
+                }
                 partitions.push(BSubPartition {
                     subblock_index,
                     sub_partition_index: 0,
@@ -3001,12 +3255,9 @@ fn decode_b_sub_macroblock_partitions_ordered(
         }
     }
 
-    partitions.extend(
-        pending
-            .into_iter()
-            .map(BSubPartitionPending::finish)
-            .collect::<Result<Vec<_>, _>>()?,
-    );
+    for partition in pending {
+        partitions.push(partition.finish()?);
+    }
     partitions.sort_by_key(|partition| (partition.subblock_index, partition.sub_partition_index));
     Ok(partitions)
 }
@@ -3019,8 +3270,8 @@ fn decode_p_sub_macroblock_partitions_ordered(
     address: MacroblockAddress,
     cabac: &mut CabacDecoder<'_>,
     mvd_contexts: &mut CabacMotionVectorContexts,
-) -> Result<Vec<PSubPartition>, H264422P10PictureDecodeError> {
-    let mut partitions = Vec::new();
+) -> Result<SmallVec<[PSubPartition; 16]>, H264422P10PictureDecodeError> {
+    let mut partitions = SmallVec::new();
     for (subblock_index, sub_type) in sub_types.into_iter().enumerate() {
         let (shape, partition_count) = match sub_type {
             PSubMacroblockType::L0_8x8 => (BSubPartitionShape::Full8x8, 1),
@@ -3197,28 +3448,28 @@ enum InterPrediction {
     Full16x16(MotionVectorQuarterPel),
     Horizontal16x8([MotionVectorQuarterPel; 2]),
     Vertical8x16([MotionVectorQuarterPel; 2]),
-    SubPartitions(Vec<PSubPartition>),
+    SubPartitions(SmallVec<[PSubPartition; 16]>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InterLumaResidual {
     Absent,
-    Blocks4x4(Box<[ResidualBlock4x4; 16]>),
-    Blocks8x8(Box<[ResidualBlock8x8; 4]>),
+    Blocks4x4([ResidualBlock4x4; 16]),
+    Blocks4x4Dequantized([ResidualBlock4x4; 16]),
+    Blocks8x8([ResidualBlock8x8; 4]),
 }
 
 impl InterPrediction {
     fn copy_from_reference(
         &self,
-        decoded: &BTreeMap<(u16, i32), DecodedPicture>,
-        list0: &[H264PictureId],
+        list0: &[&DecodedFrame422P10],
         ref_idx: [u8; 4],
         target: &mut DecodedFrame422P10,
         address: MacroblockAddress,
     ) -> Result<(), H264422P10PictureDecodeError> {
         match self {
             Self::Full16x16(motion) => predict_inter_16x16(
-                list_frame(decoded, list0, ref_idx[0])?,
+                resolved_frame(list0, ref_idx[0])?,
                 target,
                 address.x as usize,
                 address.y as usize,
@@ -3228,7 +3479,7 @@ impl InterPrediction {
                 for (index, motion) in motions.iter().copied().enumerate() {
                     let slot = [0, 2][index];
                     predict_inter_16x8(
-                        list_frame(decoded, list0, ref_idx[slot])?,
+                        resolved_frame(list0, ref_idx[slot])?,
                         target,
                         address.x as usize,
                         address.y as usize,
@@ -3240,7 +3491,7 @@ impl InterPrediction {
             Self::Vertical8x16(motions) => {
                 for (index, motion) in motions.iter().copied().enumerate() {
                     predict_inter_8x16(
-                        list_frame(decoded, list0, ref_idx[index])?,
+                        resolved_frame(list0, ref_idx[index])?,
                         target,
                         address.x as usize,
                         address.y as usize,
@@ -3252,7 +3503,7 @@ impl InterPrediction {
             Self::SubPartitions(partitions) => {
                 for partition in partitions {
                     let reference =
-                        list_frame(decoded, list0, ref_idx[partition.subblock_index.min(3)])?;
+                        resolved_frame(list0, ref_idx[partition.subblock_index.min(3)])?;
                     partition.copy_from_reference(reference, target, address)?;
                 }
             }
@@ -3269,16 +3520,508 @@ enum BInterPrediction {
         l0: MotionVectorQuarterPel,
         l1: MotionVectorQuarterPel,
     },
+    Direct16x16(DirectBlock),
     Horizontal16x8([BPartitionMotion; 2]),
     Vertical8x16([BPartitionMotion; 2]),
-    SubPartitions(Vec<BSubPartition>),
+    SubPartitions(SmallVec<[BSubPartition; 16]>),
     Direct8x8([DirectBlock; 4]),
+}
+
+enum SonyBInterKernel {
+    L0 {
+        motion: MotionVectorQuarterPel,
+        reference: u8,
+    },
+    L1 {
+        motion: MotionVectorQuarterPel,
+        reference: u8,
+    },
+    Bi {
+        l0: MotionVectorQuarterPel,
+        l1: MotionVectorQuarterPel,
+        reference_l0: u8,
+        reference_l1: u8,
+        weight0: i32,
+        weight1: i32,
+    },
+}
+
+struct SonyBInterCommand {
+    kernel: SonyBInterKernel,
+    address: MacroblockAddress,
+}
+
+struct SonyBResidual {
+    luma: InterLumaResidual,
+    chroma: Option<([ResidualBlock4x4; 8], [ResidualBlock4x4; 8])>,
+    qp_y: u8,
+    qp_cb: u8,
+    qp_cr: u8,
+}
+
+impl SonyBInterCommand {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        prediction: &BInterPrediction,
+        refs_l0: [u8; 4],
+        refs_l1: [u8; 4],
+        address: MacroblockAddress,
+        list0_ids: &[H264PictureId],
+        list1_ids: &[H264PictureId],
+        current_poc: i32,
+        implicit_weights: bool,
+    ) -> Option<Self> {
+        let weights = |reference_l0: u8, reference_l1: u8| {
+            if !implicit_weights {
+                return (32, 32);
+            }
+            let poc0 = list0_ids
+                .get(usize::from(reference_l0))
+                .map(|id| id.poc)
+                .unwrap_or(current_poc);
+            let poc1 = list1_ids
+                .get(usize::from(reference_l1))
+                .map(|id| id.poc)
+                .unwrap_or(current_poc);
+            implicit_bipred_weights(current_poc, poc0, poc1)
+        };
+        let kernel = match prediction {
+            BInterPrediction::L0Full16x16(motion) => SonyBInterKernel::L0 {
+                motion: *motion,
+                reference: refs_l0[0],
+            },
+            BInterPrediction::L1Full16x16(motion) => SonyBInterKernel::L1 {
+                motion: *motion,
+                reference: refs_l1[0],
+            },
+            BInterPrediction::Bi16x16 { l0, l1 } => {
+                let (weight0, weight1) = weights(refs_l0[0], refs_l1[0]);
+                SonyBInterKernel::Bi {
+                    l0: *l0,
+                    l1: *l1,
+                    reference_l0: refs_l0[0],
+                    reference_l1: refs_l1[0],
+                    weight0,
+                    weight1,
+                }
+            }
+            BInterPrediction::Direct16x16(block) => match block.motion {
+                BPartitionMotion::L0(motion) => SonyBInterKernel::L0 {
+                    motion,
+                    reference: block.ref_l0,
+                },
+                BPartitionMotion::L1(motion) => SonyBInterKernel::L1 {
+                    motion,
+                    reference: block.ref_l1,
+                },
+                BPartitionMotion::Bi { l0, l1 } => {
+                    let (weight0, weight1) = weights(block.ref_l0, block.ref_l1);
+                    SonyBInterKernel::Bi {
+                        l0,
+                        l1,
+                        reference_l0: block.ref_l0,
+                        reference_l1: block.ref_l1,
+                        weight0,
+                        weight1,
+                    }
+                }
+            },
+            _ => return None,
+        };
+        Some(Self { kernel, address })
+    }
+
+    fn execute(
+        self,
+        list0: &[&DecodedFrame422P10],
+        list1: &[&DecodedFrame422P10],
+        target: &mut DecodedFrame422P10,
+    ) -> Result<(), H264422P10PictureDecodeError> {
+        let x = self.address.x as usize;
+        let y = self.address.y as usize;
+        match self.kernel {
+            SonyBInterKernel::L0 { motion, reference } => {
+                predict_inter_16x16(resolved_frame(list0, reference)?, target, x, y, motion)?;
+            }
+            SonyBInterKernel::L1 { motion, reference } => {
+                predict_inter_16x16(resolved_frame(list1, reference)?, target, x, y, motion)?;
+            }
+            SonyBInterKernel::Bi {
+                l0,
+                l1,
+                reference_l0,
+                reference_l1,
+                weight0,
+                weight1,
+            } => {
+                predict_bi_inter_16x16(
+                    resolved_frame(list0, reference_l0)?,
+                    resolved_frame(list1, reference_l1)?,
+                    target,
+                    x,
+                    y,
+                    l0,
+                    l1,
+                    weight0,
+                    weight1,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_fused(
+        self,
+        list0: &[&DecodedFrame422P10],
+        list1: &[&DecodedFrame422P10],
+        target: &mut DecodedFrame422P10,
+        residual: SonyBResidual,
+    ) -> Result<(), H264422P10PictureDecodeError> {
+        let x = self.address.x as usize;
+        let y = self.address.y as usize;
+        let mut luma = [0_u16; 16 * 16];
+        let mut cb = [0_u16; 8 * 16];
+        let mut cr = [0_u16; 8 * 16];
+        match self.kernel {
+            SonyBInterKernel::L0 { motion, reference } => {
+                let reference = resolved_frame(list0, reference)?;
+                predict_inter_luma_16x16_block(reference, x, y, motion, &mut luma)?;
+                predict_inter_chroma_16x16_blocks(reference, x, y, motion, &mut cb, &mut cr)?;
+            }
+            SonyBInterKernel::L1 { motion, reference } => {
+                let reference = resolved_frame(list1, reference)?;
+                predict_inter_luma_16x16_block(reference, x, y, motion, &mut luma)?;
+                predict_inter_chroma_16x16_blocks(reference, x, y, motion, &mut cb, &mut cr)?;
+            }
+            SonyBInterKernel::Bi {
+                l0,
+                l1,
+                reference_l0,
+                reference_l1,
+                weight0,
+                weight1,
+            } => {
+                let reference0 = resolved_frame(list0, reference_l0)?;
+                let reference1 = resolved_frame(list1, reference_l1)?;
+                predict_bi_inter_luma_16x16_block(
+                    reference0, reference1, x, y, l0, l1, weight0, weight1, &mut luma,
+                )?;
+                predict_bi_inter_chroma_16x16_blocks(
+                    reference0, reference1, x, y, l0, l1, weight0, weight1, &mut cb, &mut cr,
+                )?;
+            }
+        }
+        let luma_ok = match &residual.luma {
+            InterLumaResidual::Absent => {
+                let zero = std::array::from_fn(|_| ResidualBlock4x4::zero());
+                reconstruct_inter_luma_16x16_local(target, x, y, residual.qp_y, &zero, &mut luma)
+            }
+            InterLumaResidual::Blocks4x4(blocks) => {
+                reconstruct_inter_luma_16x16_local(target, x, y, residual.qp_y, blocks, &mut luma)
+            }
+            InterLumaResidual::Blocks4x4Dequantized(blocks) => {
+                reconstruct_inter_luma_16x16_local_predequantized(target, x, y, blocks, &mut luma)
+            }
+            InterLumaResidual::Blocks8x8(blocks) => {
+                reconstruct_inter_luma_8x8_local(target, x, y, residual.qp_y, blocks, &mut luma)
+            }
+        };
+        if !luma_ok {
+            return Err(MacroblockReconstructionError::OutOfBounds.into());
+        }
+        let zero;
+        let (cb_residual, cr_residual) = if let Some((cb_residual, cr_residual)) = &residual.chroma
+        {
+            (cb_residual, cr_residual)
+        } else {
+            zero = std::array::from_fn(|_| ResidualBlock4x4::zero());
+            (&zero, &zero)
+        };
+        if !reconstruct_inter_chroma_422_local(
+            target,
+            ChromaPlane::Cb,
+            x,
+            y,
+            residual.qp_cb,
+            cb_residual,
+            &mut cb,
+        ) || !reconstruct_inter_chroma_422_local(
+            target,
+            ChromaPlane::Cr,
+            x,
+            y,
+            residual.qp_cr,
+            cr_residual,
+            &mut cr,
+        ) {
+            return Err(MacroblockReconstructionError::OutOfBounds.into());
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_p_inter_fused(
+    prediction: &InterPrediction,
+    list0: &[&DecodedFrame422P10],
+    ref_idx: [u8; 4],
+    target: &mut DecodedFrame422P10,
+    address: MacroblockAddress,
+    luma_residuals: InterLumaResidual,
+    chroma_residuals: Option<([ResidualBlock4x4; 8], [ResidualBlock4x4; 8])>,
+    qp_y: u8,
+    qp_cb: u8,
+    qp_cr: u8,
+) -> Result<(), H264422P10PictureDecodeError> {
+    let x = address.x as usize;
+    let y = address.y as usize;
+    let mut luma = [0_u16; 16 * 16];
+    let mut cb = [0_u16; 8 * 16];
+    let mut cr = [0_u16; 8 * 16];
+    match prediction {
+        InterPrediction::Full16x16(motion) => {
+            let reference = resolved_frame(list0, ref_idx[0])?;
+            predict_inter_luma_16x16_block(reference, x, y, *motion, &mut luma)?;
+            predict_inter_chroma_16x16_blocks(reference, x, y, *motion, &mut cb, &mut cr)?;
+        }
+        InterPrediction::Horizontal16x8(motions) => {
+            for (index, motion) in motions.iter().copied().enumerate() {
+                let slot = [0, 2][index];
+                let reference = resolved_frame(list0, ref_idx[slot])?;
+                let dst_luma_y = y * 16 + index * 8;
+                let dst_chroma_y = y * 16 + index * 8;
+                let local_luma_y = index * 8;
+                predict_inter_luma_region_into(
+                    reference,
+                    x * 16,
+                    dst_luma_y,
+                    16,
+                    8,
+                    motion,
+                    &mut luma[local_luma_y * 16..],
+                    16,
+                )?;
+                predict_inter_chroma_region_into(
+                    reference,
+                    x * 8,
+                    dst_chroma_y,
+                    0,
+                    local_luma_y,
+                    8,
+                    8,
+                    motion,
+                    &mut cb,
+                    &mut cr,
+                )?;
+            }
+        }
+        InterPrediction::Vertical8x16(motions) => {
+            for (index, motion) in motions.iter().copied().enumerate() {
+                let reference = resolved_frame(list0, ref_idx[index])?;
+                let dst_luma_x = x * 16 + index * 8;
+                let dst_chroma_x = x * 8 + index * 4;
+                let local_luma_x = index * 8;
+                let local_chroma_x = index * 4;
+                let mut strip = [0_u16; 8 * 16];
+                predict_inter_luma_region_into(
+                    reference,
+                    dst_luma_x,
+                    y * 16,
+                    8,
+                    16,
+                    motion,
+                    &mut strip,
+                    8,
+                )?;
+                for row in 0..16 {
+                    let dst = row * 16 + local_luma_x;
+                    luma[dst..dst + 8].copy_from_slice(&strip[row * 8..row * 8 + 8]);
+                }
+                predict_inter_chroma_region_into(
+                    reference,
+                    dst_chroma_x,
+                    y * 16,
+                    local_chroma_x,
+                    0,
+                    4,
+                    16,
+                    motion,
+                    &mut cb,
+                    &mut cr,
+                )?;
+            }
+        }
+        InterPrediction::SubPartitions(_) => {
+            return Err(H264422P10PictureDecodeError::Unsupported(
+                "P fused reconstruct requires full or split-16 partitions",
+            ));
+        }
+    }
+
+    if matches!(luma_residuals, InterLumaResidual::Absent) && chroma_residuals.is_none() {
+        if !store_local_inter_prediction(target, x, y, &luma, &cb, &cr) {
+            return Err(MacroblockReconstructionError::OutOfBounds.into());
+        }
+        return Ok(());
+    }
+
+    let luma_ok = match &luma_residuals {
+        InterLumaResidual::Absent => write_local_luma_16x16(target, x, y, &luma),
+        InterLumaResidual::Blocks4x4(blocks) => {
+            reconstruct_inter_luma_16x16_local(target, x, y, qp_y, blocks, &mut luma)
+        }
+        InterLumaResidual::Blocks4x4Dequantized(blocks) => {
+            reconstruct_inter_luma_16x16_local_predequantized(target, x, y, blocks, &mut luma)
+        }
+        InterLumaResidual::Blocks8x8(blocks) => {
+            reconstruct_inter_luma_8x8_local(target, x, y, qp_y, blocks, &mut luma)
+        }
+    };
+    if !luma_ok {
+        return Err(MacroblockReconstructionError::OutOfBounds.into());
+    }
+    if let Some((cb_residual, cr_residual)) = &chroma_residuals {
+        if !reconstruct_inter_chroma_422_local(
+            target,
+            ChromaPlane::Cb,
+            x,
+            y,
+            qp_cb,
+            cb_residual,
+            &mut cb,
+        ) || !reconstruct_inter_chroma_422_local(
+            target,
+            ChromaPlane::Cr,
+            x,
+            y,
+            qp_cr,
+            cr_residual,
+            &mut cr,
+        ) {
+            return Err(MacroblockReconstructionError::OutOfBounds.into());
+        }
+    } else if !write_local_chroma_8x16(target, ChromaPlane::Cb, x, y, &cb)
+        || !write_local_chroma_8x16(target, ChromaPlane::Cr, x, y, &cr)
+    {
+        return Err(MacroblockReconstructionError::OutOfBounds.into());
+    }
+    Ok(())
+}
+
+fn apply_sony_b_residual(
+    frame: &mut DecodedFrame422P10,
+    address: MacroblockAddress,
+    residual: SonyBResidual,
+) -> Result<(), H264422P10PictureDecodeError> {
+    let x = address.x as usize;
+    let y = address.y as usize;
+    match residual.luma {
+        InterLumaResidual::Absent => {}
+        InterLumaResidual::Blocks4x4(blocks) => {
+            if !add_luma_residual_16x16(frame, x, y, residual.qp_y, &blocks) {
+                return Err(MacroblockReconstructionError::OutOfBounds.into());
+            }
+        }
+        InterLumaResidual::Blocks4x4Dequantized(blocks) => {
+            if !add_luma_residual_16x16_predequantized(frame, x, y, &blocks) {
+                return Err(MacroblockReconstructionError::OutOfBounds.into());
+            }
+        }
+        InterLumaResidual::Blocks8x8(blocks) => {
+            if !add_luma_residual_8x8(frame, x, y, residual.qp_y, &blocks) {
+                return Err(MacroblockReconstructionError::OutOfBounds.into());
+            }
+        }
+    }
+    if let Some((cb, cr)) = residual.chroma {
+        if !add_chroma_residual_422_prescaled(
+            frame,
+            ChromaPlane::Cb,
+            x,
+            y,
+            residual.qp_cb,
+            &cb,
+            false,
+        ) || !add_chroma_residual_422_prescaled(
+            frame,
+            ChromaPlane::Cr,
+            x,
+            y,
+            residual.qp_cr,
+            &cr,
+            false,
+        ) {
+            return Err(MacroblockReconstructionError::OutOfBounds.into());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn b_plan_kernel(
+    prediction: &BInterPrediction,
+    refs_l0: [u8; 4],
+    refs_l1: [u8; 4],
+    list0_ids: &[H264PictureId],
+    list1_ids: &[H264PictureId],
+    current_poc: i32,
+    implicit_weights: bool,
+) -> Option<PlanKernel> {
+    let command = SonyBInterCommand::new(
+        prediction,
+        refs_l0,
+        refs_l1,
+        MacroblockAddress {
+            address: 0,
+            x: 0,
+            y: 0,
+        },
+        list0_ids,
+        list1_ids,
+        current_poc,
+        implicit_weights,
+    )?;
+    Some(match command.kernel {
+        SonyBInterKernel::L0 { motion, reference } => PlanKernel::L0 { motion, reference },
+        SonyBInterKernel::L1 { motion, reference } => PlanKernel::L1 { motion, reference },
+        SonyBInterKernel::Bi {
+            l0,
+            l1,
+            reference_l0,
+            reference_l1,
+            weight0,
+            weight1,
+        } => PlanKernel::Bi {
+            l0,
+            l1,
+            reference_l0,
+            reference_l1,
+            weight0,
+            weight1,
+        },
+    })
+}
+
+fn pack_plan_luma(plan: &mut SonySlicePlan, luma: InterLumaResidual) -> PlanLumaResidual {
+    match luma {
+        InterLumaResidual::Absent => PlanLumaResidual::Absent,
+        InterLumaResidual::Blocks4x4(blocks) => {
+            PlanLumaResidual::Blocks4x4(plan.push_luma4x4(blocks))
+        }
+        InterLumaResidual::Blocks4x4Dequantized(blocks) => {
+            PlanLumaResidual::Blocks4x4Dequantized(plan.push_luma4x4_dequantized(blocks))
+        }
+        InterLumaResidual::Blocks8x8(blocks) => {
+            PlanLumaResidual::Blocks8x8(plan.push_luma8x8(blocks))
+        }
+    }
 }
 
 impl BInterPrediction {
     fn copy_from_references(
-        self,
-        decoded: &BTreeMap<(u16, i32), DecodedPicture>,
+        &self,
+        list0: &[&DecodedFrame422P10],
+        list1: &[&DecodedFrame422P10],
         list0_ids: &[H264PictureId],
         list1_ids: &[H264PictureId],
         ref_idx_l0: [u8; 4],
@@ -3288,8 +4031,8 @@ impl BInterPrediction {
         current_poc: i32,
         implicit_weights: bool,
     ) -> Result<(), H264422P10PictureDecodeError> {
-        let frame0 = |index: usize| list_frame(decoded, list0_ids, ref_idx_l0[index.min(3)]);
-        let frame1 = |index: usize| list_frame(decoded, list1_ids, ref_idx_l1[index.min(3)]);
+        let frame0 = |index: usize| resolved_frame(list0, ref_idx_l0[index.min(3)]);
+        let frame1 = |index: usize| resolved_frame(list1, ref_idx_l1[index.min(3)]);
         let weights = |index: usize| {
             if !implicit_weights {
                 return (32, 32);
@@ -3310,14 +4053,14 @@ impl BInterPrediction {
                 target,
                 address.x as usize,
                 address.y as usize,
-                motion,
+                *motion,
             )?,
             Self::L1Full16x16(motion) => predict_inter_16x16(
                 frame1(0)?,
                 target,
                 address.x as usize,
                 address.y as usize,
-                motion,
+                *motion,
             )?,
             Self::Bi16x16 { l0, l1 } => {
                 let (weight0, weight1) = weights(0);
@@ -3327,14 +4070,54 @@ impl BInterPrediction {
                     target,
                     address.x as usize,
                     address.y as usize,
-                    l0,
-                    l1,
+                    *l0,
+                    *l1,
+                    weight0,
+                    weight1,
+                )?;
+            }
+            Self::Direct16x16(block) => {
+                let (reference_l0, reference_l1) = match block.motion {
+                    BPartitionMotion::L0(_) => (Some(resolved_frame(list0, block.ref_l0)?), None),
+                    BPartitionMotion::L1(_) => (None, Some(resolved_frame(list1, block.ref_l1)?)),
+                    BPartitionMotion::Bi { .. } => (
+                        Some(resolved_frame(list0, block.ref_l0)?),
+                        Some(resolved_frame(list1, block.ref_l1)?),
+                    ),
+                };
+                let (weight0, weight1) =
+                    if implicit_weights && matches!(block.motion, BPartitionMotion::Bi { .. }) {
+                        let poc0 = list0_ids
+                            .get(usize::from(block.ref_l0))
+                            .map(|id| id.poc)
+                            .unwrap_or(current_poc);
+                        let poc1 = list1_ids
+                            .get(usize::from(block.ref_l1))
+                            .map(|id| id.poc)
+                            .unwrap_or(current_poc);
+                        implicit_bipred_weights(current_poc, poc0, poc1)
+                    } else {
+                        (32, 32)
+                    };
+                SonyDirect16x16Command {
+                    motion: match block.motion {
+                        BPartitionMotion::L0(motion) => SonyDirectMotion::L0(motion),
+                        BPartitionMotion::L1(motion) => SonyDirectMotion::L1(motion),
+                        BPartitionMotion::Bi { l0, l1 } => SonyDirectMotion::Bi { l0, l1 },
+                    },
+                }
+                .reconstruct(
+                    reference_l0,
+                    reference_l1,
+                    target,
+                    address.x as usize,
+                    address.y as usize,
                     weight0,
                     weight1,
                 )?;
             }
             Self::Horizontal16x8(partitions) => {
-                for (index, partition) in partitions.into_iter().enumerate() {
+                for (index, partition) in partitions.iter().copied().enumerate() {
                     let slot = [0, 2][index];
                     let (weight0, weight1) = weights(slot);
                     partition.copy_16x8(
@@ -3349,7 +4132,7 @@ impl BInterPrediction {
                 }
             }
             Self::Vertical8x16(partitions) => {
-                for (index, partition) in partitions.into_iter().enumerate() {
+                for (index, partition) in partitions.iter().copied().enumerate() {
                     let (weight0, weight1) = weights(index);
                     partition.copy_8x16(
                         frame0(index)?,
@@ -3363,57 +4146,154 @@ impl BInterPrediction {
                 }
             }
             Self::SubPartitions(partitions) => {
-                for partition in partitions {
+                let mut cells = [None; 16];
+                for partition in partitions.iter().copied() {
                     let index = partition.subblock_index.min(3);
                     let ref0 = partition.direct_ref_l0.unwrap_or(ref_idx_l0[index]);
                     let ref1 = partition.direct_ref_l1.unwrap_or(ref_idx_l1[index]);
-                    let list0 = list_frame(decoded, list0_ids, ref0)?;
-                    let list1 = list_frame(decoded, list1_ids, ref1)?;
-                    let (weight0, weight1) = if implicit_weights {
-                        let poc0 = list0_ids
-                            .get(usize::from(ref0))
-                            .map(|id| id.poc)
-                            .unwrap_or(current_poc);
-                        let poc1 = list1_ids
-                            .get(usize::from(ref1))
-                            .map(|id| id.poc)
-                            .unwrap_or(current_poc);
-                        implicit_bipred_weights(current_poc, poc0, poc1)
-                    } else {
-                        (32, 32)
+                    let key = DirectBlock::canonical(partition.motion, ref0, ref1);
+                    let (x, y, width, height) = partition.region();
+                    for cell_y in (y / 4)..((y + height) / 4) {
+                        for cell_x in (x / 4)..((x + width) / 4) {
+                            cells[cell_y * 4 + cell_x] = Some(key);
+                        }
+                    }
+                }
+                let mut consumed = 0_u16;
+                for cell in 0..16 {
+                    if consumed & (1 << cell) != 0 {
+                        continue;
+                    }
+                    let Some(key) = cells[cell] else {
+                        continue;
                     };
-                    partition
-                        .copy_from_references(list0, list1, target, address, weight0, weight1)?;
+                    let x = cell % 4;
+                    let y = cell / 4;
+                    let mut width = 1;
+                    while x + width < 4 {
+                        let next = y * 4 + x + width;
+                        if consumed & (1 << next) != 0 || cells[next] != Some(key) {
+                            break;
+                        }
+                        width += 1;
+                    }
+                    let mut height = 1;
+                    'rows: while y + height < 4 {
+                        for column in 0..width {
+                            let next = (y + height) * 4 + x + column;
+                            if consumed & (1 << next) != 0 || cells[next] != Some(key) {
+                                break 'rows;
+                            }
+                        }
+                        height += 1;
+                    }
+                    for row in 0..height {
+                        for column in 0..width {
+                            consumed |= 1 << ((y + row) * 4 + x + column);
+                        }
+                    }
+                    key.copy_region(
+                        list0,
+                        list1,
+                        list0_ids,
+                        list1_ids,
+                        target,
+                        address.x as usize * 16 + x * 4,
+                        address.y as usize * 16 + y * 4,
+                        width * 4,
+                        height * 4,
+                        current_poc,
+                        implicit_weights,
+                    )?;
                 }
             }
             Self::Direct8x8(blocks) => {
-                for (index, block) in blocks.into_iter().enumerate() {
-                    let list0 = list_frame(decoded, list0_ids, block.ref_l0)?;
-                    let list1 = list_frame(decoded, list1_ids, block.ref_l1)?;
-                    let (weight0, weight1) = if implicit_weights {
-                        let poc0 = list0_ids
-                            .get(usize::from(block.ref_l0))
-                            .map(|id| id.poc)
-                            .unwrap_or(current_poc);
-                        let poc1 = list1_ids
-                            .get(usize::from(block.ref_l1))
-                            .map(|id| id.poc)
-                            .unwrap_or(current_poc);
-                        implicit_bipred_weights(current_poc, poc0, poc1)
-                    } else {
-                        (32, 32)
-                    };
-                    block.motion.copy_region(
+                let base_x = address.x as usize * 16;
+                let base_y = address.y as usize * 16;
+                if blocks[1] == blocks[0] && blocks[2] == blocks[0] && blocks[3] == blocks[0] {
+                    blocks[0].copy_region(
                         list0,
                         list1,
+                        list0_ids,
+                        list1_ids,
                         target,
-                        address.x as usize * 16 + (index % 2) * 8,
-                        address.y as usize * 16 + (index / 2) * 8,
-                        8,
-                        8,
-                        weight0,
-                        weight1,
+                        base_x,
+                        base_y,
+                        16,
+                        16,
+                        current_poc,
+                        implicit_weights,
                     )?;
+                } else if blocks[1] == blocks[0] && blocks[3] == blocks[2] {
+                    blocks[0].copy_region(
+                        list0,
+                        list1,
+                        list0_ids,
+                        list1_ids,
+                        target,
+                        base_x,
+                        base_y,
+                        16,
+                        8,
+                        current_poc,
+                        implicit_weights,
+                    )?;
+                    blocks[2].copy_region(
+                        list0,
+                        list1,
+                        list0_ids,
+                        list1_ids,
+                        target,
+                        base_x,
+                        base_y + 8,
+                        16,
+                        8,
+                        current_poc,
+                        implicit_weights,
+                    )?;
+                } else if blocks[2] == blocks[0] && blocks[3] == blocks[1] {
+                    blocks[0].copy_region(
+                        list0,
+                        list1,
+                        list0_ids,
+                        list1_ids,
+                        target,
+                        base_x,
+                        base_y,
+                        8,
+                        16,
+                        current_poc,
+                        implicit_weights,
+                    )?;
+                    blocks[1].copy_region(
+                        list0,
+                        list1,
+                        list0_ids,
+                        list1_ids,
+                        target,
+                        base_x + 8,
+                        base_y,
+                        8,
+                        16,
+                        current_poc,
+                        implicit_weights,
+                    )?;
+                } else {
+                    for (index, block) in blocks.iter().copied().enumerate() {
+                        block.copy_region(
+                            list0,
+                            list1,
+                            list0_ids,
+                            list1_ids,
+                            target,
+                            base_x + (index % 2) * 8,
+                            base_y + (index / 2) * 8,
+                            8,
+                            8,
+                            current_poc,
+                            implicit_weights,
+                        )?;
+                    }
                 }
             }
         }
@@ -3426,6 +4306,88 @@ struct DirectBlock {
     motion: BPartitionMotion,
     ref_l0: u8,
     ref_l1: u8,
+}
+
+impl DirectBlock {
+    fn canonical(motion: BPartitionMotion, ref_l0: u8, ref_l1: u8) -> Self {
+        match motion {
+            BPartitionMotion::L0(_) => Self {
+                motion,
+                ref_l0,
+                ref_l1: 0,
+            },
+            BPartitionMotion::L1(_) => Self {
+                motion,
+                ref_l0: 0,
+                ref_l1,
+            },
+            BPartitionMotion::Bi { .. } => Self {
+                motion,
+                ref_l0,
+                ref_l1,
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_region(
+        self,
+        list0: &[&DecodedFrame422P10],
+        list1: &[&DecodedFrame422P10],
+        list0_ids: &[H264PictureId],
+        list1_ids: &[H264PictureId],
+        target: &mut DecodedFrame422P10,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        current_poc: i32,
+        implicit_weights: bool,
+    ) -> Result<(), H264422P10PictureDecodeError> {
+        match self.motion {
+            BPartitionMotion::L0(motion) => predict_inter_region(
+                resolved_frame(list0, self.ref_l0)?,
+                target,
+                x,
+                y,
+                width,
+                height,
+                motion,
+            )
+            .map_err(Into::into),
+            BPartitionMotion::L1(motion) => predict_inter_region(
+                resolved_frame(list1, self.ref_l1)?,
+                target,
+                x,
+                y,
+                width,
+                height,
+                motion,
+            )
+            .map_err(Into::into),
+            BPartitionMotion::Bi { l0, l1 } => {
+                let list0 = resolved_frame(list0, self.ref_l0)?;
+                let list1 = resolved_frame(list1, self.ref_l1)?;
+                let (weight0, weight1) = if implicit_weights {
+                    let poc0 = list0_ids
+                        .get(usize::from(self.ref_l0))
+                        .map(|id| id.poc)
+                        .unwrap_or(current_poc);
+                    let poc1 = list1_ids
+                        .get(usize::from(self.ref_l1))
+                        .map(|id| id.poc)
+                        .unwrap_or(current_poc);
+                    implicit_bipred_weights(current_poc, poc0, poc1)
+                } else {
+                    (32, 32)
+                };
+                predict_bi_inter_region(
+                    list0, list1, target, x, y, width, height, l0, l1, weight0, weight1,
+                )
+                .map_err(Into::into)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3585,23 +4547,6 @@ impl BSubPartitionPending {
 }
 
 impl BSubPartition {
-    fn copy_from_references(
-        self,
-        list0: &DecodedFrame422P10,
-        list1: &DecodedFrame422P10,
-        target: &mut DecodedFrame422P10,
-        address: MacroblockAddress,
-        weight0: i32,
-        weight1: i32,
-    ) -> Result<(), H264422P10PictureDecodeError> {
-        let (x_offset, y_offset, width, height) = self.region();
-        let base_x = address.x as usize * 16 + x_offset;
-        let base_y = address.y as usize * 16 + y_offset;
-        self.motion.copy_region(
-            list0, list1, target, base_x, base_y, width, height, weight0, weight1,
-        )
-    }
-
     fn region(self) -> (usize, usize, usize, usize) {
         sub_partition_region(self.subblock_index, self.sub_partition_index, self.shape)
     }
@@ -3685,54 +4630,6 @@ impl BPartitionMotion {
                 address.x as usize,
                 address.y as usize,
                 partition_index,
-                l0,
-                l1,
-                weight0,
-                weight1,
-            )?,
-        }
-        Ok(())
-    }
-
-    fn copy_region(
-        self,
-        list0: &DecodedFrame422P10,
-        list1: &DecodedFrame422P10,
-        target: &mut DecodedFrame422P10,
-        dst_luma_x: usize,
-        dst_luma_y: usize,
-        luma_width: usize,
-        luma_height: usize,
-        weight0: i32,
-        weight1: i32,
-    ) -> Result<(), H264422P10PictureDecodeError> {
-        match self {
-            Self::L0(motion) => predict_inter_region(
-                list0,
-                target,
-                dst_luma_x,
-                dst_luma_y,
-                luma_width,
-                luma_height,
-                motion,
-            )?,
-            Self::L1(motion) => predict_inter_region(
-                list1,
-                target,
-                dst_luma_x,
-                dst_luma_y,
-                luma_width,
-                luma_height,
-                motion,
-            )?,
-            Self::Bi { l0, l1 } => predict_bi_inter_region(
-                list0,
-                list1,
-                target,
-                dst_luma_x,
-                dst_luma_y,
-                luma_width,
-                luma_height,
                 l0,
                 l1,
                 weight0,
@@ -4042,6 +4939,7 @@ fn decode_chroma_residual_blocks_422(
     qp_y: i16,
     cb_offset: i8,
     cr_offset: i8,
+    scaling: &PictureScaling,
 ) -> Result<Option<([ResidualBlock4x4; 8], [ResidualBlock4x4; 8])>, H264422P10PictureDecodeError> {
     let chroma = residual_decoder.decode_chroma_422(cabac, address, coded_block_pattern_chroma)?;
     if coded_block_pattern_chroma == CodedBlockPatternChroma::Zero {
@@ -4050,6 +4948,8 @@ fn decode_chroma_residual_blocks_422(
     let [cb, cr] = chroma.into_reconstruction_blocks(
         chroma_qp_prime(qp_y, cb_offset),
         chroma_qp_prime(qp_y, cr_offset),
+        scaling.weight4x4[4][0][0],
+        scaling.weight4x4[5][0][0],
     );
     Ok(Some((cb, cr)))
 }
@@ -4089,11 +4989,12 @@ fn decode_inter_luma_residual(
                 luma[block_index] = decode_residual_8x8(cabac, luma8x8_residual_contexts)?.block;
             }
         }
-        Ok(InterLumaResidual::Blocks8x8(Box::new(luma)))
+        Ok(InterLumaResidual::Blocks8x8(luma))
     } else {
-        Ok(InterLumaResidual::Blocks4x4(Box::new(
-            decode_luma_residual_blocks(cabac, luma_residual_contexts)?,
-        )))
+        Ok(InterLumaResidual::Blocks4x4(decode_luma_residual_blocks(
+            cabac,
+            luma_residual_contexts,
+        )?))
     }
 }
 
@@ -4106,6 +5007,8 @@ fn decode_inter_luma_residual_422(
     transform_size_8x8_flags: &mut [bool],
     residual_decoder: &mut CabacResidualDecoder422,
     luma8x8_residual_contexts: &mut CabacResidual8x8Contexts,
+    qp_y: u8,
+    scaling: &PictureScaling,
 ) -> Result<InterLumaResidual, H264422P10PictureDecodeError> {
     if cbp.luma == 0 && cbp.chroma == CodedBlockPatternChroma::Zero {
         if let Some(slot) = transform_size_8x8_flags.get_mut(address.address as usize) {
@@ -4135,17 +5038,23 @@ fn decode_inter_luma_residual_422(
                 residual_decoder.record_luma8x8_count(
                     address,
                     block_index,
-                    residual.report.non_zero_coefficients,
+                    usize::from(residual.non_zero_coefficients),
                 );
                 luma[block_index] = residual.block;
             } else {
                 residual_decoder.record_luma8x8_count(address, block_index, 0);
             }
         }
-        Ok(InterLumaResidual::Blocks8x8(Box::new(luma)))
+        Ok(InterLumaResidual::Blocks8x8(luma))
     } else {
-        let (luma, _) = residual_decoder.decode_inter4x4_luma(cabac, address, cbp.luma)?;
-        Ok(InterLumaResidual::Blocks4x4(Box::new(luma)))
+        let luma = residual_decoder.decode_inter4x4_luma_dequantized(
+            cabac,
+            address,
+            cbp.luma,
+            qp_y,
+            &scaling.weight4x4[3],
+        )?;
+        Ok(InterLumaResidual::Blocks4x4Dequantized(luma))
     }
 }
 
@@ -4163,6 +5072,7 @@ fn decode_i_slice_into_frame(
     deblock: &mut DeblockGrid,
     slice_id: u16,
 ) -> Result<SliceDecodeProgress, H264422P10PictureDecodeError> {
+    frame.slice_first_mb = u32::from(slice.first_mb_in_slice);
     let payload = slice_payload_from_parsed(parsed, slice)?;
     let payload = payload.cabac_payload_bytes()?;
     let cabac_payload_bits = payload.len().saturating_mul(8);
@@ -4542,13 +5452,21 @@ fn reconstruct_supported_i_macroblock(
                     address,
                     coded_block_pattern_luma,
                 )?;
-                macroblock.luma = luma.into_reconstruction_blocks(reconstruction_qp);
+                macroblock.luma = luma.into_reconstruction_blocks(
+                    reconstruction_qp,
+                    frame.scaling.weight4x4[0][0][0],
+                );
                 let chroma = residual_decoder.decode_chroma_422(
                     cabac,
                     address,
                     coded_block_pattern_chroma,
                 )?;
-                let [cb, cr] = chroma.into_reconstruction_blocks(qp_cb, qp_cr);
+                let [cb, cr] = chroma.into_reconstruction_blocks(
+                    qp_cb,
+                    qp_cr,
+                    frame.scaling.weight4x4[1][0][0],
+                    frame.scaling.weight4x4[2][0][0],
+                );
                 macroblock.cb = cb;
                 macroblock.cr = cr;
             } else {
@@ -4675,7 +5593,7 @@ fn reconstruct_supported_i_macroblock(
                             residual_decoder.record_luma8x8_count(
                                 address,
                                 block_index,
-                                residual.report.non_zero_coefficients,
+                                usize::from(residual.non_zero_coefficients),
                             );
                         }
                         luma[block_index] = residual.block;
@@ -4683,6 +5601,25 @@ fn reconstruct_supported_i_macroblock(
                         residual_decoder.record_luma8x8_count(address, block_index, 0);
                     }
                 }
+                let chroma_residuals = if let Some(residual_decoder) =
+                    residual_decoder_422.as_deref_mut()
+                {
+                    let chroma = residual_decoder.decode_chroma_422(cabac, address, cbp.chroma)?;
+                    let [cb, cr] = chroma.into_reconstruction_blocks(
+                        qp_cb,
+                        qp_cr,
+                        frame.scaling.weight4x4[1][0][0],
+                        frame.scaling.weight4x4[2][0][0],
+                    );
+                    Some((cb, cr))
+                } else {
+                    decode_chroma_residual_blocks(
+                        cabac,
+                        cbp.chroma,
+                        cb_residual_contexts,
+                        cr_residual_contexts,
+                    )?
+                };
                 reconstruct_intra8x8_luma(
                     frame,
                     address.x as usize,
@@ -4691,7 +5628,12 @@ fn reconstruct_supported_i_macroblock(
                     &modes,
                     &luma,
                 )?;
-                let zero_chroma = std::array::from_fn(|_| ResidualBlock4x4::zero());
+                let (cb, cr) = chroma_residuals.unwrap_or_else(|| {
+                    (
+                        std::array::from_fn(|_| ResidualBlock4x4::zero()),
+                        std::array::from_fn(|_| ResidualBlock4x4::zero()),
+                    )
+                });
                 if !reconstruct_chroma_422_intra(
                     frame,
                     ChromaPlane::Cb,
@@ -4699,7 +5641,7 @@ fn reconstruct_supported_i_macroblock(
                     address.y as usize,
                     qp_cb,
                     chroma_pred_mode.unwrap_or(0),
-                    &zero_chroma,
+                    &cb,
                 ) || !reconstruct_chroma_422_intra(
                     frame,
                     ChromaPlane::Cr,
@@ -4707,53 +5649,9 @@ fn reconstruct_supported_i_macroblock(
                     address.y as usize,
                     qp_cr,
                     chroma_pred_mode.unwrap_or(0),
-                    &zero_chroma,
+                    &cr,
                 ) {
                     return Err(MacroblockReconstructionError::OutOfBounds.into());
-                }
-                if let Some(residual_decoder) = residual_decoder_422.as_deref_mut() {
-                    let chroma = residual_decoder.decode_chroma_422(cabac, address, cbp.chroma)?;
-                    let [cb, cr] = chroma.into_reconstruction_blocks(qp_cb, qp_cr);
-                    if !add_chroma_residual_422_prescaled(
-                        frame,
-                        ChromaPlane::Cb,
-                        address.x as usize,
-                        address.y as usize,
-                        qp_cb,
-                        &cb,
-                    ) || !add_chroma_residual_422_prescaled(
-                        frame,
-                        ChromaPlane::Cr,
-                        address.x as usize,
-                        address.y as usize,
-                        qp_cr,
-                        &cr,
-                    ) {
-                        return Err(MacroblockReconstructionError::OutOfBounds.into());
-                    }
-                } else if let Some((cb, cr)) = decode_chroma_residual_blocks(
-                    cabac,
-                    cbp.chroma,
-                    cb_residual_contexts,
-                    cr_residual_contexts,
-                )? {
-                    if !add_chroma_residual_422(
-                        frame,
-                        ChromaPlane::Cb,
-                        address.x as usize,
-                        address.y as usize,
-                        qp_cb,
-                        &cb,
-                    ) || !add_chroma_residual_422(
-                        frame,
-                        ChromaPlane::Cr,
-                        address.x as usize,
-                        address.y as usize,
-                        qp_cr,
-                        &cr,
-                    ) {
-                        return Err(MacroblockReconstructionError::OutOfBounds.into());
-                    }
                 }
                 return Ok((cbp, chroma_pred_mode));
             }
@@ -4797,14 +5695,30 @@ fn reconstruct_supported_i_macroblock(
             let qp_cb = chroma_qp_prime(*current_qp_y, chroma_cb_offset);
             let qp_cr = chroma_qp_prime(*current_qp_y, chroma_cr_offset);
             let luma = if let Some(residual_decoder) = residual_decoder_422.as_deref_mut() {
-                residual_decoder
-                    .decode_intra4x4_luma(cabac, address, cbp.luma)?
-                    .0
+                residual_decoder.decode_intra4x4_luma(cabac, address, cbp.luma)?
             } else if cbp.luma == 0 {
                 std::array::from_fn(|_| ResidualBlock4x4::zero())
             } else {
                 decode_luma_residual_blocks(cabac, luma_residual_contexts)?
             };
+            let chroma_residuals =
+                if let Some(residual_decoder) = residual_decoder_422.as_deref_mut() {
+                    let chroma = residual_decoder.decode_chroma_422(cabac, address, cbp.chroma)?;
+                    let [cb, cr] = chroma.into_reconstruction_blocks(
+                        qp_cb,
+                        qp_cr,
+                        frame.scaling.weight4x4[1][0][0],
+                        frame.scaling.weight4x4[2][0][0],
+                    );
+                    Some((cb, cr))
+                } else {
+                    decode_chroma_residual_blocks(
+                        cabac,
+                        cbp.chroma,
+                        cb_residual_contexts,
+                        cr_residual_contexts,
+                    )?
+                };
             reconstruct_intra4x4_luma(
                 frame,
                 address.x as usize,
@@ -4813,7 +5727,12 @@ fn reconstruct_supported_i_macroblock(
                 &modes,
                 &luma,
             )?;
-            let zero_chroma = std::array::from_fn(|_| ResidualBlock4x4::zero());
+            let (cb, cr) = chroma_residuals.unwrap_or_else(|| {
+                (
+                    std::array::from_fn(|_| ResidualBlock4x4::zero()),
+                    std::array::from_fn(|_| ResidualBlock4x4::zero()),
+                )
+            });
             if !reconstruct_chroma_422_intra(
                 frame,
                 ChromaPlane::Cb,
@@ -4821,7 +5740,7 @@ fn reconstruct_supported_i_macroblock(
                 address.y as usize,
                 qp_cb,
                 chroma_pred_mode.unwrap_or(0),
-                &zero_chroma,
+                &cb,
             ) || !reconstruct_chroma_422_intra(
                 frame,
                 ChromaPlane::Cr,
@@ -4829,53 +5748,9 @@ fn reconstruct_supported_i_macroblock(
                 address.y as usize,
                 qp_cr,
                 chroma_pred_mode.unwrap_or(0),
-                &zero_chroma,
+                &cr,
             ) {
                 return Err(MacroblockReconstructionError::OutOfBounds.into());
-            }
-            if let Some(residual_decoder) = residual_decoder_422.as_deref_mut() {
-                let chroma = residual_decoder.decode_chroma_422(cabac, address, cbp.chroma)?;
-                let [cb, cr] = chroma.into_reconstruction_blocks(qp_cb, qp_cr);
-                if !add_chroma_residual_422_prescaled(
-                    frame,
-                    ChromaPlane::Cb,
-                    address.x as usize,
-                    address.y as usize,
-                    qp_cb,
-                    &cb,
-                ) || !add_chroma_residual_422_prescaled(
-                    frame,
-                    ChromaPlane::Cr,
-                    address.x as usize,
-                    address.y as usize,
-                    qp_cr,
-                    &cr,
-                ) {
-                    return Err(MacroblockReconstructionError::OutOfBounds.into());
-                }
-            } else if let Some((cb, cr)) = decode_chroma_residual_blocks(
-                cabac,
-                cbp.chroma,
-                cb_residual_contexts,
-                cr_residual_contexts,
-            )? {
-                if !add_chroma_residual_422(
-                    frame,
-                    ChromaPlane::Cb,
-                    address.x as usize,
-                    address.y as usize,
-                    qp_cb,
-                    &cb,
-                ) || !add_chroma_residual_422(
-                    frame,
-                    ChromaPlane::Cr,
-                    address.x as usize,
-                    address.y as usize,
-                    qp_cr,
-                    &cr,
-                ) {
-                    return Err(MacroblockReconstructionError::OutOfBounds.into());
-                }
             }
             Ok((cbp, chroma_pred_mode))
         }
@@ -5218,9 +6093,12 @@ fn top_left_luma_sample(frame: &DecodedFrame422P10, address: MacroblockAddress) 
     if address.x == 0 || address.y == 0 {
         return None;
     }
-    frame
-        .y
-        .get(address.x as usize * 16 - 1, address.y as usize * 16 - 1)
+    let x = address.x as usize * 16 - 1;
+    let y = address.y as usize * 16 - 1;
+    if !frame.luma_in_slice(x, y) {
+        return None;
+    }
+    frame.y.get(x, y)
 }
 
 fn top_luma_samples(frame: &DecodedFrame422P10, address: MacroblockAddress) -> Option<[u16; 16]> {
@@ -5229,6 +6107,9 @@ fn top_luma_samples(frame: &DecodedFrame422P10, address: MacroblockAddress) -> O
     }
     let y = address.y as usize * 16 - 1;
     let x = address.x as usize * 16;
+    if !frame.luma_in_slice(x, y) {
+        return None;
+    }
     let mut samples = [0_u16; 16];
     for (index, sample) in samples.iter_mut().enumerate() {
         *sample = frame.y.get(x + index, y)?;
@@ -5242,6 +6123,9 @@ fn left_luma_samples(frame: &DecodedFrame422P10, address: MacroblockAddress) -> 
     }
     let x = address.x as usize * 16 - 1;
     let y = address.y as usize * 16;
+    if !frame.luma_in_slice(x, y) {
+        return None;
+    }
     let mut samples = [0_u16; 16];
     for (index, sample) in samples.iter_mut().enumerate() {
         *sample = frame.y.get(x, y + index)?;
@@ -5273,6 +6157,43 @@ fn plane_to_output(plane: &Plane422P10) -> H264422P10Plane {
         height: plane.height as u32,
         stride_bytes: plane.width * 2,
         data: plane.to_le_bytes(),
+    }
+}
+
+fn frame_into_output(
+    presentation_index: u64,
+    frame: DecodedFrame422P10,
+) -> Result<H264422P10Frame, H264422P10PictureDecodeError> {
+    let DecodedFrame422P10 {
+        coded_width,
+        coded_height,
+        visible_width,
+        visible_height,
+        y,
+        cb,
+        cr,
+        ..
+    } = frame;
+    let out = H264422P10Frame {
+        presentation_index,
+        coded_width: coded_width as u32,
+        coded_height: coded_height as u32,
+        visible_width: visible_width as u32,
+        visible_height: visible_height as u32,
+        y: plane_into_output(y),
+        cb: plane_into_output(cb),
+        cr: plane_into_output(cr),
+    };
+    out.validate_layout()?;
+    Ok(out)
+}
+
+fn plane_into_output(plane: Plane422P10) -> H264422P10Plane {
+    H264422P10Plane {
+        width_samples: plane.width as u32,
+        height: plane.height as u32,
+        stride_bytes: plane.width * 2,
+        data: plane.into_le_bytes(),
     }
 }
 
@@ -5420,6 +6341,23 @@ impl From<MacroblockReconstructionError> for H264422P10PictureDecodeError {
 impl From<MotionCompensationError> for H264422P10PictureDecodeError {
     fn from(value: MotionCompensationError) -> Self {
         Self::Motion(value)
+    }
+}
+
+impl From<PlanExecuteError> for H264422P10PictureDecodeError {
+    fn from(value: PlanExecuteError) -> Self {
+        match value {
+            PlanExecuteError::OutOfBounds => {
+                Self::Macroblock(MacroblockReconstructionError::OutOfBounds)
+            }
+            PlanExecuteError::MissingReference => {
+                Self::Unsupported("reference index exceeds the resolved picture list")
+            }
+            PlanExecuteError::CorruptPlan => Self::Unsupported("corrupt Sony reconstruct plan"),
+            PlanExecuteError::MotionVectorOverflow => {
+                Self::Motion(MotionCompensationError::MotionVectorOverflow)
+            }
+        }
     }
 }
 

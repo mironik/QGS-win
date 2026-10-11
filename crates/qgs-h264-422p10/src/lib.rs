@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod bitstream;
 pub mod bytestream;
@@ -13,9 +13,13 @@ pub mod decoder;
 pub mod frame;
 pub mod macroblock;
 pub mod macroblock_type;
+mod mc_interp;
 pub mod motion;
 pub mod residual;
+mod simd;
 pub mod slice;
+mod sony_fast;
+mod sony_plan;
 pub mod transform;
 
 use std::collections::BTreeMap;

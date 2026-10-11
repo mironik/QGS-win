@@ -1,0 +1,5 @@
+[target.'cfg(all(target_arch = "x86_64", target_os = "windows"))']
+# QGS Windows playback targets CPUs with AVX2/BMI2-class instruction sets.
+# This lets the single-thread 10-bit decoder use the AVX2 implementations in
+# `wide` while remaining portable across x86-64-v3 machines.
+rustflags = ["-C", "target-cpu=x86-64-v3"]

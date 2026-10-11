@@ -41,12 +41,16 @@ pub struct MotionField {
     width_in_mbs: u32,
     height_in_mbs: u32,
     decoded: Vec<bool>,
-    l0: Vec<Option<MotionSample>>,
-    l1: Vec<Option<MotionSample>>,
+    l0: Vec<MotionSample>,
+    l1: Vec<MotionSample>,
+    /// Per-macroblock bitmasks: bit N set means 4x4 scan block N has a sample.
+    l0_present: Vec<u16>,
+    l1_present: Vec<u16>,
     /// 4x4 blocks whose partition is already known and does not use that list.
     /// Same-macroblock neighbors must see these as ref -1, not as not-yet-decoded.
     l0_unused: Vec<u16>,
     l1_unused: Vec<u16>,
+    slice_first_mb: u32,
 }
 
 impl MotionField {
@@ -58,11 +62,43 @@ impl MotionField {
             width_in_mbs: grid.width_in_mbs,
             height_in_mbs: grid.height_in_mbs,
             decoded: vec![false; macroblocks],
-            l0: vec![None; count],
-            l1: vec![None; count],
+            l0: vec![
+                MotionSample {
+                    vector: MotionVectorQuarterPel::ZERO,
+                    ref_index: 0,
+                };
+                count
+            ],
+            l1: vec![
+                MotionSample {
+                    vector: MotionVectorQuarterPel::ZERO,
+                    ref_index: 0,
+                };
+                count
+            ],
+            l0_present: vec![0; macroblocks],
+            l1_present: vec![0; macroblocks],
             l0_unused: vec![0; macroblocks],
             l1_unused: vec![0; macroblocks],
+            slice_first_mb: 0,
         })
+    }
+
+    pub fn set_slice_first_mb(&mut self, slice_first_mb: u32) {
+        self.slice_first_mb = slice_first_mb;
+    }
+
+    pub(crate) fn matches_grid(&self, grid: MacroblockGrid) -> bool {
+        self.width_in_mbs == grid.width_in_mbs && self.height_in_mbs == grid.height_in_mbs
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.decoded.fill(false);
+        self.l0_present.fill(0);
+        self.l1_present.fill(0);
+        self.l0_unused.fill(0);
+        self.l1_unused.fill(0);
+        self.slice_first_mb = 0;
     }
 
     pub fn mark_list_unused(
@@ -245,55 +281,19 @@ impl MotionField {
         let col_zero = colocated.is_some_and(|sample| {
             sample.ref_index == 0 && sample.vector.x.abs() <= 1 && sample.vector.y.abs() <= 1
         });
-        let mut l0 = self.spatial_direct_list(
-            address,
-            origin_x as i32,
-            origin_y as i32,
-            width as i32,
-            false,
-            col_zero,
-        )?;
-        let mut l1 = self.spatial_direct_list(
-            address,
-            origin_x as i32,
-            origin_y as i32,
-            width as i32,
-            true,
-            col_zero,
-        )?;
+        let left = self.neighbor_pair(address, origin_x as i32 - 1, origin_y as i32);
+        let top = self.neighbor_pair(address, origin_x as i32, origin_y as i32 - 1);
+        let top_right = self.neighbor_pair(address, (origin_x + width) as i32, origin_y as i32 - 1);
+        let top_left = self.neighbor_pair(address, origin_x as i32 - 1, origin_y as i32 - 1);
+        let mut l0 =
+            spatial_direct_from_neighbors(left.0, top.0, top_right.0, top_left.0, col_zero);
+        let mut l1 =
+            spatial_direct_from_neighbors(left.1, top.1, top_right.1, top_left.1, col_zero);
         if l0.is_none() && l1.is_none() {
             l0 = Some((MotionVectorQuarterPel::ZERO, 0));
             l1 = Some((MotionVectorQuarterPel::ZERO, 0));
         }
         Ok((l0, l1))
-    }
-
-    fn spatial_direct_list(
-        &self,
-        address: MacroblockAddress,
-        origin_x: i32,
-        origin_y: i32,
-        width: i32,
-        use_l1: bool,
-        col_zero: bool,
-    ) -> Result<Option<(MotionVectorQuarterPel, u8)>, MotionCompensationError> {
-        let left = self.neighbor_block(address, origin_x - 1, origin_y, use_l1);
-        let top = self.neighbor_block(address, origin_x, origin_y - 1, use_l1);
-        let top_right = self.neighbor_block(address, origin_x + width, origin_y - 1, use_l1);
-        let top_left = self.neighbor_block(address, origin_x - 1, origin_y - 1, use_l1);
-        let diagonal = substitute_unavailable_diagonal(top_right, top_left);
-        let reference = min_positive(
-            diagonal_ref(left),
-            min_positive(diagonal_ref(top), diagonal_ref(diagonal)),
-        );
-        if reference < 0 {
-            return Ok(None);
-        }
-        let mut motion = median_prediction(left, top, diagonal, reference as u8);
-        if col_zero && reference == 0 {
-            motion = MotionVectorQuarterPel::ZERO;
-        }
-        Ok(Some((motion, reference as u8)))
     }
 
     pub fn predict_partition(
@@ -350,6 +350,35 @@ impl MotionField {
         block_y: i32,
         use_l1: bool,
     ) -> MotionNeighbor {
+        let Some((macroblock, scan)) = self.neighbor_location(address, block_x, block_y) else {
+            return MotionNeighbor::MISSING;
+        };
+        self.neighbor_at(address, macroblock, scan, use_l1)
+    }
+
+    #[inline(always)]
+    fn neighbor_pair(
+        &self,
+        address: MacroblockAddress,
+        block_x: i32,
+        block_y: i32,
+    ) -> (MotionNeighbor, MotionNeighbor) {
+        let Some((macroblock, scan)) = self.neighbor_location(address, block_x, block_y) else {
+            return (MotionNeighbor::MISSING, MotionNeighbor::MISSING);
+        };
+        (
+            self.neighbor_at(address, macroblock, scan, false),
+            self.neighbor_at(address, macroblock, scan, true),
+        )
+    }
+
+    #[inline(always)]
+    fn neighbor_location(
+        &self,
+        address: MacroblockAddress,
+        block_x: i32,
+        block_y: i32,
+    ) -> Option<(usize, usize)> {
         let mut macroblock_x = i32::try_from(address.x).unwrap_or(i32::MAX);
         let mut macroblock_y = i32::try_from(address.y).unwrap_or(i32::MAX);
         let mut local_x = block_x;
@@ -377,7 +406,7 @@ impl MotionField {
             || macroblock_x as u32 >= self.width_in_mbs
             || macroblock_y as u32 >= self.height_in_mbs
         {
-            return MotionNeighbor::MISSING;
+            return None;
         }
         let scan = ((local_y as usize & 1) << 1)
             | (local_x as usize & 1)
@@ -386,30 +415,63 @@ impl MotionField {
         let macroblock = (macroblock_y as u32)
             .saturating_mul(self.width_in_mbs)
             .saturating_add(macroblock_x as u32);
-        if let Some(sample) =
-            self.block_sample(macroblock_x as u32, macroblock_y as u32, scan, use_l1)
-        {
-            return MotionNeighbor {
-                partition_available: true,
-                vector: sample.vector,
-                ref_index: i16::from(sample.ref_index),
-            };
+        if macroblock < self.slice_first_mb {
+            return None;
         }
-        if self.list_unused(macroblock, scan, use_l1) {
+        Some((macroblock as usize, scan))
+    }
+
+    #[inline(always)]
+    fn neighbor_at(
+        &self,
+        address: MacroblockAddress,
+        macroblock_index: usize,
+        scan: usize,
+        use_l1: bool,
+    ) -> MotionNeighbor {
+        let block_index = macroblock_index * 16 + scan;
+        let bit = 1_u16 << scan;
+        let (primary, primary_present, secondary_present, unused) = if use_l1 {
+            (
+                &self.l1,
+                &self.l1_present,
+                &self.l0_present,
+                &self.l1_unused,
+            )
+        } else {
+            (
+                &self.l0,
+                &self.l0_present,
+                &self.l1_present,
+                &self.l0_unused,
+            )
+        };
+        if primary_present
+            .get(macroblock_index)
+            .is_some_and(|mask| mask & bit != 0)
+        {
+            if let Some(sample) = primary.get(block_index).copied() {
+                return MotionNeighbor {
+                    partition_available: true,
+                    vector: sample.vector,
+                    ref_index: i16::from(sample.ref_index),
+                };
+            }
+        }
+        if unused
+            .get(macroblock_index)
+            .is_some_and(|mask| mask & bit != 0)
+        {
             return MotionNeighbor::INTRA;
         }
-        if self
-            .block_sample(macroblock_x as u32, macroblock_y as u32, scan, !use_l1)
-            .is_some()
+        if secondary_present
+            .get(macroblock_index)
+            .is_some_and(|mask| mask & bit != 0)
         {
             return MotionNeighbor::INTRA;
         }
-        let finished = self
-            .decoded
-            .get(macroblock as usize)
-            .copied()
-            .unwrap_or(false)
-            && macroblock != address.address;
+        let finished = self.decoded.get(macroblock_index).copied().unwrap_or(false)
+            && macroblock_index != address.address as usize;
         if finished {
             MotionNeighbor::INTRA
         } else {
@@ -428,17 +490,6 @@ impl MotionField {
         Ok(())
     }
 
-    fn list_unused(&self, macroblock: u32, scan: usize, use_l1: bool) -> bool {
-        let masks = if use_l1 {
-            &self.l1_unused
-        } else {
-            &self.l0_unused
-        };
-        masks
-            .get(macroblock as usize)
-            .is_some_and(|mask| mask & (1_u16 << scan) != 0)
-    }
-
     fn sample_at(&self, x: u32, y: u32, use_l1: bool) -> Option<MotionSample> {
         self.block_sample(x, y, 0, use_l1)
     }
@@ -449,8 +500,16 @@ impl MotionField {
         }
         let macroblock =
             usize::try_from(y.saturating_mul(self.width_in_mbs).saturating_add(x)).ok()?;
+        let present = if use_l1 {
+            &self.l1_present
+        } else {
+            &self.l0_present
+        };
+        if present.get(macroblock).copied().unwrap_or(0) & (1_u16 << block) == 0 {
+            return None;
+        }
         let samples = if use_l1 { &self.l1 } else { &self.l0 };
-        samples.get(macroblock * 16 + block).copied().flatten()
+        samples.get(macroblock * 16 + block).copied()
     }
 
     fn write_blocks(
@@ -462,12 +521,21 @@ impl MotionField {
         use_l1: bool,
     ) -> Result<(), MotionCompensationError> {
         let base = self.macroblock_base(address)?;
-        let samples = if use_l1 { &mut self.l1 } else { &mut self.l0 };
+        let mb = address.address as usize;
+        let (samples, present) = if use_l1 {
+            (&mut self.l1, &mut self.l1_present)
+        } else {
+            (&mut self.l0, &mut self.l0_present)
+        };
+        let Some(mask) = present.get_mut(mb) else {
+            return Err(MotionCompensationError::OutOfBounds);
+        };
         for block in blocks {
             let Some(slot) = samples.get_mut(base + *block) else {
                 return Err(MotionCompensationError::OutOfBounds);
             };
-            *slot = Some(MotionSample { vector, ref_index });
+            *slot = MotionSample { vector, ref_index };
+            *mask |= 1_u16 << *block;
         }
         self.mark_decoded(address)?;
         Ok(())
@@ -479,13 +547,20 @@ impl MotionField {
         blocks: &[usize],
         use_l1: bool,
     ) -> Result<(), MotionCompensationError> {
-        let base = self.macroblock_base(address)?;
-        let samples = if use_l1 { &mut self.l1 } else { &mut self.l0 };
+        let mb = address.address as usize;
+        let present = if use_l1 {
+            &mut self.l1_present
+        } else {
+            &mut self.l0_present
+        };
+        let Some(mask) = present.get_mut(mb) else {
+            return Err(MotionCompensationError::OutOfBounds);
+        };
         for block in blocks {
-            let Some(slot) = samples.get_mut(base + *block) else {
+            if *block >= 16 {
                 return Err(MotionCompensationError::OutOfBounds);
-            };
-            *slot = None;
+            }
+            *mask &= !(1_u16 << *block);
         }
         Ok(())
     }
@@ -564,6 +639,29 @@ fn substitute_unavailable_diagonal(
     }
 }
 
+#[inline(always)]
+fn spatial_direct_from_neighbors(
+    left: MotionNeighbor,
+    top: MotionNeighbor,
+    top_right: MotionNeighbor,
+    top_left: MotionNeighbor,
+    col_zero: bool,
+) -> Option<(MotionVectorQuarterPel, u8)> {
+    let diagonal = substitute_unavailable_diagonal(top_right, top_left);
+    let reference = min_positive(
+        diagonal_ref(left),
+        min_positive(diagonal_ref(top), diagonal_ref(diagonal)),
+    );
+    if reference < 0 {
+        return None;
+    }
+    let mut motion = median_prediction(left, top, diagonal, reference as u8);
+    if col_zero && reference == 0 {
+        motion = MotionVectorQuarterPel::ZERO;
+    }
+    Some((motion, reference as u8))
+}
+
 fn diagonal_ref(neighbor: MotionNeighbor) -> i16 {
     neighbor.ref_index
 }
@@ -638,6 +736,99 @@ pub fn predict_inter_16x16(
     Ok(())
 }
 
+pub(crate) fn predict_inter_luma_16x16_block(
+    reference: &DecodedFrame422P10,
+    dst_mb_x: usize,
+    dst_mb_y: usize,
+    motion: MotionVectorQuarterPel,
+    output: &mut [u16; 16 * 16],
+) -> Result<(), MotionCompensationError> {
+    let dst_x = dst_mb_x
+        .checked_mul(16)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    let dst_y = dst_mb_y
+        .checked_mul(16)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    crate::mc_interp::predict_luma_block(&reference.y, output, 16, dst_x, dst_y, 16, 16, motion)
+}
+
+pub(crate) fn predict_inter_chroma_16x16_blocks(
+    reference: &DecodedFrame422P10,
+    dst_mb_x: usize,
+    dst_mb_y: usize,
+    motion: MotionVectorQuarterPel,
+    cb: &mut [u16; 8 * 16],
+    cr: &mut [u16; 8 * 16],
+) -> Result<(), MotionCompensationError> {
+    let dst_x = dst_mb_x
+        .checked_mul(8)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    let dst_y = dst_mb_y
+        .checked_mul(16)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    crate::mc_interp::predict_chroma_block(
+        &reference.cb,
+        &reference.cr,
+        cb,
+        cr,
+        dst_x,
+        dst_y,
+        motion,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_inter_luma_region_into(
+    reference: &DecodedFrame422P10,
+    dst_luma_x: usize,
+    dst_luma_y: usize,
+    width: usize,
+    height: usize,
+    motion: MotionVectorQuarterPel,
+    output: &mut [u16],
+    output_stride: usize,
+) -> Result<(), MotionCompensationError> {
+    crate::mc_interp::predict_luma_block(
+        &reference.y,
+        output,
+        output_stride,
+        dst_luma_x,
+        dst_luma_y,
+        width,
+        height,
+        motion,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_inter_chroma_region_into(
+    reference: &DecodedFrame422P10,
+    dst_chroma_x: usize,
+    dst_chroma_y: usize,
+    local_x: usize,
+    local_y: usize,
+    width: usize,
+    height: usize,
+    motion: MotionVectorQuarterPel,
+    cb: &mut [u16; 8 * 16],
+    cr: &mut [u16; 8 * 16],
+) -> Result<(), MotionCompensationError> {
+    crate::mc_interp::predict_chroma_region_into(
+        &reference.cb,
+        &reference.cr,
+        cb,
+        cr,
+        8,
+        local_x,
+        local_y,
+        dst_chroma_x,
+        dst_chroma_y,
+        width,
+        height,
+        motion,
+    )
+}
+
 pub fn predict_bi_inter_16x16(
     list0: &DecodedFrame422P10,
     list1: &DecodedFrame422P10,
@@ -679,6 +870,54 @@ pub fn predict_bi_inter_16x16(
         weight1,
     )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_bi_inter_luma_16x16_block(
+    list0: &DecodedFrame422P10,
+    list1: &DecodedFrame422P10,
+    dst_mb_x: usize,
+    dst_mb_y: usize,
+    motion0: MotionVectorQuarterPel,
+    motion1: MotionVectorQuarterPel,
+    weight0: i32,
+    weight1: i32,
+    output: &mut [u16; 16 * 16],
+) -> Result<(), MotionCompensationError> {
+    let dst_x = dst_mb_x
+        .checked_mul(16)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    let dst_y = dst_mb_y
+        .checked_mul(16)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    crate::mc_interp::predict_luma_bi_block(
+        &list0.y, &list1.y, output, dst_x, dst_y, motion0, motion1, weight0, weight1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_bi_inter_chroma_16x16_blocks(
+    list0: &DecodedFrame422P10,
+    list1: &DecodedFrame422P10,
+    dst_mb_x: usize,
+    dst_mb_y: usize,
+    motion0: MotionVectorQuarterPel,
+    motion1: MotionVectorQuarterPel,
+    weight0: i32,
+    weight1: i32,
+    cb: &mut [u16; 8 * 16],
+    cr: &mut [u16; 8 * 16],
+) -> Result<(), MotionCompensationError> {
+    let dst_x = dst_mb_x
+        .checked_mul(8)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    let dst_y = dst_mb_y
+        .checked_mul(16)
+        .ok_or(MotionCompensationError::OutOfBounds)?;
+    crate::mc_interp::predict_chroma_bi_block(
+        &list0.cb, &list0.cr, &list1.cb, &list1.cr, cb, cr, dst_x, dst_y, motion0, motion1,
+        weight0, weight1,
+    )
 }
 
 pub fn predict_inter_16x8(
@@ -1026,25 +1265,15 @@ fn copy_luma_prediction_region(
     height: usize,
     motion: MotionVectorQuarterPel,
 ) -> Result<(), MotionCompensationError> {
-    for row in 0..height {
-        for column in 0..width {
-            let sample = luma_quarter_sample(
-                reference,
-                ((dst_x + column) as i32)
-                    .checked_mul(4)
-                    .and_then(|value| value.checked_add(motion.x))
-                    .ok_or(MotionCompensationError::OutOfBounds)?,
-                ((dst_y + row) as i32)
-                    .checked_mul(4)
-                    .and_then(|value| value.checked_add(motion.y))
-                    .ok_or(MotionCompensationError::OutOfBounds)?,
-            )?;
-            if !target.y.set(dst_x + column, dst_y + row, sample) {
-                return Err(MotionCompensationError::OutOfBounds);
-            }
-        }
-    }
-    Ok(())
+    crate::mc_interp::put_luma(
+        &reference.y,
+        &mut target.y,
+        dst_x,
+        dst_y,
+        width,
+        height,
+        motion,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1061,40 +1290,19 @@ fn copy_bi_luma_prediction_region(
     weight0: i32,
     weight1: i32,
 ) -> Result<(), MotionCompensationError> {
-    for row in 0..height {
-        for column in 0..width {
-            let sample0 = luma_quarter_sample(
-                list0,
-                ((dst_x + column) as i32)
-                    .checked_mul(4)
-                    .and_then(|value| value.checked_add(motion0.x))
-                    .ok_or(MotionCompensationError::OutOfBounds)?,
-                ((dst_y + row) as i32)
-                    .checked_mul(4)
-                    .and_then(|value| value.checked_add(motion0.y))
-                    .ok_or(MotionCompensationError::OutOfBounds)?,
-            )?;
-            let sample1 = luma_quarter_sample(
-                list1,
-                ((dst_x + column) as i32)
-                    .checked_mul(4)
-                    .and_then(|value| value.checked_add(motion1.x))
-                    .ok_or(MotionCompensationError::OutOfBounds)?,
-                ((dst_y + row) as i32)
-                    .checked_mul(4)
-                    .and_then(|value| value.checked_add(motion1.y))
-                    .ok_or(MotionCompensationError::OutOfBounds)?,
-            )?;
-            if !target.y.set(
-                dst_x + column,
-                dst_y + row,
-                weighted_avg(sample0, sample1, weight0, weight1),
-            ) {
-                return Err(MotionCompensationError::OutOfBounds);
-            }
-        }
-    }
-    Ok(())
+    crate::mc_interp::put_luma_bi(
+        &list0.y,
+        &list1.y,
+        &mut target.y,
+        dst_x,
+        dst_y,
+        width,
+        height,
+        motion0,
+        motion1,
+        weight0,
+        weight1,
+    )
 }
 
 fn copy_chroma_prediction(
@@ -1116,27 +1324,17 @@ fn copy_chroma_prediction_region(
     height: usize,
     motion: MotionVectorQuarterPel,
 ) -> Result<(), MotionCompensationError> {
-    for row in 0..height {
-        for column in 0..width {
-            let sample_x = ((dst_x + column) as i32)
-                .checked_mul(8)
-                .and_then(|value| value.checked_add(motion.x))
-                .ok_or(MotionCompensationError::OutOfBounds)?;
-            let sample_y = ((dst_y + row) as i32)
-                .checked_mul(4)
-                .and_then(|value| value.checked_add(motion.y))
-                .and_then(|value| value.checked_mul(2))
-                .ok_or(MotionCompensationError::OutOfBounds)?;
-            let cb = chroma_eighth_sample(&reference.cb, sample_x, sample_y)?;
-            let cr = chroma_eighth_sample(&reference.cr, sample_x, sample_y)?;
-            if !target.cb.set(dst_x + column, dst_y + row, cb)
-                || !target.cr.set(dst_x + column, dst_y + row, cr)
-            {
-                return Err(MotionCompensationError::OutOfBounds);
-            }
-        }
-    }
-    Ok(())
+    crate::mc_interp::put_chroma(
+        &reference.cb,
+        &reference.cr,
+        &mut target.cb,
+        &mut target.cr,
+        dst_x,
+        dst_y,
+        width,
+        height,
+        motion,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1153,46 +1351,25 @@ fn copy_bi_chroma_prediction_region(
     weight0: i32,
     weight1: i32,
 ) -> Result<(), MotionCompensationError> {
-    for row in 0..height {
-        for column in 0..width {
-            let sample0_x = ((dst_x + column) as i32)
-                .checked_mul(8)
-                .and_then(|value| value.checked_add(motion0.x))
-                .ok_or(MotionCompensationError::OutOfBounds)?;
-            let sample0_y = ((dst_y + row) as i32)
-                .checked_mul(4)
-                .and_then(|value| value.checked_add(motion0.y))
-                .and_then(|value| value.checked_mul(2))
-                .ok_or(MotionCompensationError::OutOfBounds)?;
-            let sample1_x = ((dst_x + column) as i32)
-                .checked_mul(8)
-                .and_then(|value| value.checked_add(motion1.x))
-                .ok_or(MotionCompensationError::OutOfBounds)?;
-            let sample1_y = ((dst_y + row) as i32)
-                .checked_mul(4)
-                .and_then(|value| value.checked_add(motion1.y))
-                .and_then(|value| value.checked_mul(2))
-                .ok_or(MotionCompensationError::OutOfBounds)?;
-            let cb0 = chroma_eighth_sample(&list0.cb, sample0_x, sample0_y)?;
-            let cb1 = chroma_eighth_sample(&list1.cb, sample1_x, sample1_y)?;
-            let cr0 = chroma_eighth_sample(&list0.cr, sample0_x, sample0_y)?;
-            let cr1 = chroma_eighth_sample(&list1.cr, sample1_x, sample1_y)?;
-            if !target.cb.set(
-                dst_x + column,
-                dst_y + row,
-                weighted_avg(cb0, cb1, weight0, weight1),
-            ) || !target.cr.set(
-                dst_x + column,
-                dst_y + row,
-                weighted_avg(cr0, cr1, weight0, weight1),
-            ) {
-                return Err(MotionCompensationError::OutOfBounds);
-            }
-        }
-    }
-    Ok(())
+    crate::mc_interp::put_chroma_bi(
+        &list0.cb,
+        &list0.cr,
+        &list1.cb,
+        &list1.cr,
+        &mut target.cb,
+        &mut target.cr,
+        dst_x,
+        dst_y,
+        width,
+        height,
+        motion0,
+        motion1,
+        weight0,
+        weight1,
+    )
 }
 
+#[cfg(test)]
 fn luma_quarter_sample(
     reference: &DecodedFrame422P10,
     quarter_x: i32,
@@ -1231,6 +1408,7 @@ fn luma_quarter_sample(
     }
 }
 
+#[cfg(test)]
 fn luma_half_grid_sample(
     reference: &DecodedFrame422P10,
     half_x: i32,
@@ -1245,6 +1423,7 @@ fn luma_half_grid_sample(
     )
 }
 
+#[cfg(test)]
 fn luma_half_sample(
     reference: &DecodedFrame422P10,
     x: i32,
@@ -1299,6 +1478,7 @@ fn luma_half_sample(
     }
 }
 
+#[cfg(test)]
 fn chroma_eighth_sample(
     plane: &crate::frame::Plane422P10,
     eighth_x: i32,
@@ -1317,10 +1497,12 @@ fn chroma_eighth_sample(
     Ok(clip10(value))
 }
 
+#[cfg(test)]
 fn six_tap(samples: [u16; 6]) -> i32 {
     (six_tap_sum(samples) + 16) >> 5
 }
 
+#[cfg(test)]
 fn six_tap_sum(samples: [u16; 6]) -> i32 {
     i32::from(samples[0]) - 5 * i32::from(samples[1])
         + 20 * i32::from(samples[2])
@@ -1329,6 +1511,7 @@ fn six_tap_sum(samples: [u16; 6]) -> i32 {
         + i32::from(samples[5])
 }
 
+#[cfg(test)]
 fn sample_luma(
     reference: &DecodedFrame422P10,
     x: i32,
@@ -1337,6 +1520,7 @@ fn sample_luma(
     sample_plane(&reference.y, x, y)
 }
 
+#[cfg(test)]
 fn sample_plane(
     plane: &crate::frame::Plane422P10,
     x: i32,
@@ -1350,19 +1534,23 @@ fn sample_plane(
     plane.get(x, y).ok_or(MotionCompensationError::OutOfBounds)
 }
 
+#[cfg(test)]
 fn avg_round(a: u16, b: u16) -> u16 {
     weighted_avg(a, b, 32, 32)
 }
 
+#[cfg(test)]
 fn weighted_avg(a: u16, b: u16, weight0: i32, weight1: i32) -> u16 {
     let value = (i32::from(a) * weight0 + i32::from(b) * weight1 + 32) >> 6;
     clip10(value)
 }
 
+#[cfg(test)]
 fn clip10(value: i32) -> u16 {
     value.clamp(0, 1023) as u16
 }
 
+#[cfg(test)]
 fn div_floor(value: i32, divisor: i32) -> i32 {
     let quotient = value / divisor;
     let remainder = value % divisor;
@@ -1733,5 +1921,150 @@ mod tests {
             .unwrap();
 
         assert_eq!(predicted, MotionVectorQuarterPel { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn block_interpolation_matches_per_sample_filter() {
+        let mut reference = DecodedFrame422P10::new(48, 40, 48, 40);
+        for y in 0..40 {
+            for x in 0..48 {
+                assert!(reference.y.set(x, y, ((x * 17 + y * 29) % 1024) as u16));
+            }
+            for x in 0..24 {
+                assert!(reference.cb.set(x, y, ((x * 13 + y * 7) % 1024) as u16));
+                assert!(reference
+                    .cr
+                    .set(x, y, ((x * 3 + y * 11 + 40) % 1024) as u16));
+            }
+        }
+
+        let mut motions = Vec::new();
+        for fy in 0..4 {
+            for fx in 0..4 {
+                motions.push(MotionVectorQuarterPel {
+                    x: 8 + fx,
+                    y: 4 + fy,
+                });
+                motions.push(MotionVectorQuarterPel {
+                    x: -9 + fx,
+                    y: -5 + fy,
+                });
+            }
+        }
+        motions.push(MotionVectorQuarterPel { x: 13, y: -3 });
+        motions.push(MotionVectorQuarterPel { x: -2, y: 11 });
+
+        for motion in motions {
+            for (dst_x, dst_y, width, height) in [
+                (4_usize, 8_usize, 16_usize, 8_usize),
+                (0, 0, 8, 4),
+                (32, 24, 16, 16),
+            ] {
+                let mut target = DecodedFrame422P10::new(48, 40, 48, 40);
+                predict_inter_region(&reference, &mut target, dst_x, dst_y, width, height, motion)
+                    .unwrap();
+                for row in 0..height {
+                    for column in 0..width {
+                        let expected = luma_quarter_sample(
+                            &reference,
+                            (dst_x + column) as i32 * 4 + motion.x,
+                            (dst_y + row) as i32 * 4 + motion.y,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            target.y.get(dst_x + column, dst_y + row),
+                            Some(expected),
+                            "luma {motion:?} at {},{}",
+                            dst_x + column,
+                            dst_y + row
+                        );
+                    }
+                }
+                for row in 0..height {
+                    for column in 0..width / 2 {
+                        let chroma_x = dst_x / 2 + column;
+                        let sample_x = chroma_x as i32 * 8 + motion.x;
+                        let sample_y = ((dst_y + row) as i32 * 4 + motion.y) * 2;
+                        assert_eq!(
+                            target.cb.get(chroma_x, dst_y + row),
+                            Some(chroma_eighth_sample(&reference.cb, sample_x, sample_y).unwrap()),
+                            "cb {motion:?} at {chroma_x},{}",
+                            dst_y + row
+                        );
+                        assert_eq!(
+                            target.cr.get(chroma_x, dst_y + row),
+                            Some(chroma_eighth_sample(&reference.cr, sample_x, sample_y).unwrap()),
+                            "cr {motion:?} at {chroma_x},{}",
+                            dst_y + row
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_luma_prediction_matches_frame_prediction() {
+        let mut reference = DecodedFrame422P10::new(48, 48, 48, 48);
+        for y in 0..48 {
+            for x in 0..48 {
+                assert!(reference.y.set(x, y, ((x * 17 + y * 29) % 1024) as u16));
+            }
+        }
+        for motion in [
+            MotionVectorQuarterPel::ZERO,
+            MotionVectorQuarterPel { x: 2, y: 0 },
+            MotionVectorQuarterPel { x: 0, y: 2 },
+            MotionVectorQuarterPel { x: 2, y: 2 },
+            MotionVectorQuarterPel { x: 3, y: -1 },
+        ] {
+            let mut frame = DecodedFrame422P10::new(48, 48, 48, 48);
+            predict_inter_16x16(&reference, &mut frame, 1, 1, motion).unwrap();
+            let mut local = [0_u16; 16 * 16];
+            predict_inter_luma_16x16_block(&reference, 1, 1, motion, &mut local).unwrap();
+            for y in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(local[y * 16 + x], frame.y.get(16 + x, 16 + y).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_bi_luma_prediction_matches_frame_prediction() {
+        let mut list0 = DecodedFrame422P10::new(48, 48, 48, 48);
+        let mut list1 = DecodedFrame422P10::new(48, 48, 48, 48);
+        for y in 0..48 {
+            for x in 0..48 {
+                assert!(list0.y.set(x, y, ((x * 11 + y * 23) % 1024) as u16));
+                assert!(list1.y.set(x, y, ((x * 31 + y * 7 + 91) % 1024) as u16));
+            }
+        }
+        let cases = [
+            (MotionVectorQuarterPel::ZERO, MotionVectorQuarterPel::ZERO),
+            (
+                MotionVectorQuarterPel { x: 2, y: 0 },
+                MotionVectorQuarterPel { x: 0, y: 2 },
+            ),
+            (
+                MotionVectorQuarterPel { x: 2, y: 2 },
+                MotionVectorQuarterPel { x: 3, y: -1 },
+            ),
+        ];
+        for (motion0, motion1) in cases {
+            let mut frame = DecodedFrame422P10::new(48, 48, 48, 48);
+            predict_bi_inter_16x16(&list0, &list1, &mut frame, 1, 1, motion0, motion1, 40, 24)
+                .unwrap();
+            let mut local = [0_u16; 16 * 16];
+            predict_bi_inter_luma_16x16_block(
+                &list0, &list1, 1, 1, motion0, motion1, 40, 24, &mut local,
+            )
+            .unwrap();
+            for y in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(local[y * 16 + x], frame.y.get(16 + x, 16 + y).unwrap());
+                }
+            }
+        }
     }
 }

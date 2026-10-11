@@ -6,6 +6,9 @@ version.workspace = true
 description = "Narrow QGS H.264 High 4:2:2 10-bit original-video decode brick"
 
 [dependencies]
+bytemuck = "1.25"
+wide = "0.7"
 qgs-codec-h264 = { path = "../qgs-codec-h264" }
 qgs-protocol = { path = "../qgs-protocol" }
 rusty_h264-common = { version = "0.16.0", default-features = false, features = ["std"] }
+smallvec = "1.16"

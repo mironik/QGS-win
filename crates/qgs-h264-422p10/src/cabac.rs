@@ -3,15 +3,17 @@ use std::fmt;
 #[derive(Clone, Debug)]
 pub struct CabacDecoder<'a> {
     data: &'a [u8],
-    bit_pos: usize,
+    next_byte: usize,
+    bits_left: u8,
+    bit_buffer: u64,
     range: u16,
     offset: u16,
+    fault: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CabacContext {
-    pub state: u8,
-    pub mps: bool,
+    packed: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,8 +25,7 @@ pub struct CabacInitValue {
 impl CabacContext {
     pub fn new(state: u8, mps: bool) -> Self {
         Self {
-            state: state.min(63),
-            mps,
+            packed: state.min(63) | (u8::from(mps) << 6),
         }
     }
 }
@@ -50,9 +51,12 @@ impl<'a> CabacDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self, CabacError> {
         let mut decoder = Self {
             data,
-            bit_pos: 0,
+            next_byte: 0,
+            bits_left: 0,
+            bit_buffer: 0,
             range: 510,
             offset: 0,
+            fault: false,
         };
         decoder.offset = decoder.read_bits(9)? as u16;
         Ok(decoder)
@@ -62,16 +66,23 @@ impl<'a> CabacDecoder<'a> {
         self.range
     }
 
+    pub(crate) fn fault(&self) -> bool {
+        self.fault
+    }
+
     pub fn offset(&self) -> u16 {
         self.offset
     }
 
     pub fn bit_position(&self) -> usize {
-        self.bit_pos
+        self.next_byte
+            .saturating_mul(8)
+            .saturating_sub(usize::from(self.bits_left))
     }
 
     pub fn align_raw_byte(&mut self) -> Result<(), CabacError> {
-        while !self.bit_pos.is_multiple_of(8) {
+        let discard = (8 - (self.bit_position() & 7)) & 7;
+        for _ in 0..discard {
             self.read_bit()?;
         }
         Ok(())
@@ -87,13 +98,24 @@ impl<'a> CabacDecoder<'a> {
         Ok(())
     }
 
-    pub fn decode_bypass(&mut self) -> Result<bool, CabacError> {
-        self.offset = (self.offset << 1) | u16::from(self.read_bit()?);
+    #[inline(always)]
+    pub(crate) fn decode_bypass_bin(&mut self) -> bool {
+        self.offset = (self.offset << 1) | self.read_renorm_bits(1);
         if self.offset >= self.range {
             self.offset -= self.range;
-            Ok(true)
+            true
         } else {
-            Ok(false)
+            false
+        }
+    }
+
+    #[inline(always)]
+    pub fn decode_bypass(&mut self) -> Result<bool, CabacError> {
+        let bin = self.decode_bypass_bin();
+        if self.fault {
+            Err(CabacError::EndOfSlice)
+        } else {
+            Ok(bin)
         }
     }
 
@@ -154,25 +176,41 @@ impl<'a> CabacDecoder<'a> {
             .ok_or(CabacError::SymbolValueOverflow)
     }
 
-    pub fn decode_decision(&mut self, context: &mut CabacContext) -> Result<bool, CabacError> {
-        let state = usize::from(context.state.min(63));
+    /// Arithmetic bin. The slice end is a sticky flag, checked by the caller
+    /// once per block, so this stays a straight register update.
+    #[inline(always)]
+    pub(crate) fn decode_bin(&mut self, context: &mut CabacContext) -> bool {
+        let packed = context.packed;
+        let state = usize::from(packed & 63);
+        let mps = packed & 64 != 0;
         let q = usize::from((self.range >> 6) & 0x03);
         let range_lps = u16::from(RANGE_LPS[state][q]);
         let range_mps = self.range - range_lps;
         if self.offset < range_mps {
             self.range = range_mps;
-            context.state = TRANS_IDX_MPS[state];
-            self.renorm()?;
-            Ok(context.mps)
+            context.packed = TRANS_PACKED_MPS[usize::from(packed)];
+            if range_mps < 256 {
+                let shift = range_mps.leading_zeros() - 7;
+                self.range = range_mps << shift;
+                self.offset = (self.offset << shift) | self.read_renorm_bits(shift);
+            }
+            mps
         } else {
             self.offset -= range_mps;
             self.range = range_lps;
-            let bin = !context.mps;
-            if context.state == 0 {
-                context.mps = !context.mps;
-            }
-            context.state = TRANS_IDX_LPS[state];
-            self.renorm()?;
+            let bin = !mps;
+            context.packed = TRANS_PACKED_LPS[usize::from(packed)];
+            self.renorm();
+            bin
+        }
+    }
+
+    #[inline(always)]
+    pub fn decode_decision(&mut self, context: &mut CabacContext) -> Result<bool, CabacError> {
+        let bin = self.decode_bin(context);
+        if self.fault {
+            Err(CabacError::EndOfSlice)
+        } else {
             Ok(bin)
         }
     }
@@ -219,40 +257,82 @@ impl<'a> CabacDecoder<'a> {
     }
 
     pub fn decode_terminate(&mut self) -> Result<bool, CabacError> {
-        self.range = self.range.saturating_sub(2);
+        debug_assert!(self.range >= 2);
+        self.range -= 2;
         if self.offset >= self.range {
-            return Ok(true);
+            return if self.fault {
+                Err(CabacError::EndOfSlice)
+            } else {
+                Ok(true)
+            };
         }
-        self.renorm()
+        self.renorm();
+        if self.fault {
+            Err(CabacError::EndOfSlice)
+        } else {
+            Ok(false)
+        }
     }
 
-    fn renorm(&mut self) -> Result<bool, CabacError> {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | u16::from(self.read_bit()?);
+    #[inline(always)]
+    fn renorm(&mut self) {
+        if self.range < 256 {
+            let shift = self.range.leading_zeros() - 7;
+            self.range <<= shift;
+            self.offset = (self.offset << shift) | self.read_renorm_bits(shift);
         }
-        Ok(false)
     }
 
+    #[inline(always)]
+    fn read_renorm_bits(&mut self, shift: u32) -> u16 {
+        let mut bits_left = self.bits_left;
+        let mut bit_buffer = self.bit_buffer;
+        let mut next_byte = self.next_byte;
+        let len = self.data.len();
+        while u32::from(bits_left) < shift {
+            if next_byte >= len {
+                self.fault = true;
+                self.bits_left = bits_left;
+                self.bit_buffer = bit_buffer;
+                self.next_byte = next_byte;
+                return 0;
+            }
+            bit_buffer = (bit_buffer << 8) | u64::from(self.data[next_byte]);
+            next_byte += 1;
+            bits_left += 8;
+        }
+        bits_left -= shift as u8;
+        let bits = ((bit_buffer >> bits_left) as u16) & ((1_u16 << shift) - 1);
+        self.bits_left = bits_left;
+        self.bit_buffer = bit_buffer;
+        self.next_byte = next_byte;
+        bits
+    }
+
+    #[inline(always)]
     fn read_bit(&mut self) -> Result<bool, CabacError> {
-        if self.bit_pos >= self.data.len().saturating_mul(8) {
-            return Err(CabacError::EndOfSlice);
-        }
-        let byte = self.data[self.bit_pos / 8];
-        let bit = 7 - (self.bit_pos % 8);
-        self.bit_pos += 1;
-        Ok(((byte >> bit) & 1) != 0)
+        Ok(self.read_bits(1)? != 0)
     }
 
     fn read_bits(&mut self, count: usize) -> Result<u32, CabacError> {
         if count > 32 {
             return Err(CabacError::TooManyBits);
         }
-        let mut value = 0_u32;
-        for _ in 0..count {
-            value = (value << 1) | u32::from(self.read_bit()?);
+        while usize::from(self.bits_left) < count {
+            if self.next_byte >= self.data.len() {
+                return Err(CabacError::EndOfSlice);
+            }
+            self.bit_buffer = (self.bit_buffer << 8) | u64::from(self.data[self.next_byte]);
+            self.next_byte += 1;
+            self.bits_left += 8;
         }
-        Ok(value)
+        self.bits_left -= count as u8;
+        let mask = if count == 32 {
+            u64::from(u32::MAX)
+        } else {
+            (1_u64 << count) - 1
+        };
+        Ok(((self.bit_buffer >> self.bits_left) & mask) as u32)
     }
 }
 
@@ -334,6 +414,25 @@ pub const TRANS_IDX_MPS: [u8; 64] = [
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
     51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
+
+const fn build_packed_transition_tables(lps: bool) -> [u8; 128] {
+    let mut table = [0_u8; 128];
+    let mut packed = 0_usize;
+    while packed < table.len() {
+        let state = packed & 63;
+        let old_mps = (packed as u8) & 64;
+        table[packed] = if lps {
+            TRANS_IDX_LPS[state] | (old_mps ^ if state == 0 { 64 } else { 0 })
+        } else {
+            TRANS_IDX_MPS[state] | old_mps
+        };
+        packed += 1;
+    }
+    table
+}
+
+const TRANS_PACKED_MPS: [u8; 128] = build_packed_transition_tables(false);
+const TRANS_PACKED_LPS: [u8; 128] = build_packed_transition_tables(true);
 
 #[derive(Debug)]
 pub enum CabacError {

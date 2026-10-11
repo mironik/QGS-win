@@ -2,7 +2,7 @@ use crate::frame::DecodedFrame422P10;
 use crate::macroblock_type::{
     CodedBlockPatternChroma, ISliceMacroblockType, Intra16x16PredictionMode,
 };
-use crate::residual::{ResidualBlock4x4, ResidualBlock8x8};
+use crate::residual::{prepare_dequant_4x4, ResidualBlock4x4, ResidualBlock8x8};
 use crate::transform::{
     clip10, intra16x16_dc_prediction, intra16x16_horizontal_prediction,
     intra16x16_plane_prediction, intra16x16_vertical_prediction,
@@ -87,9 +87,17 @@ impl Intra16x16Macroblock {
         top_luma: Option<[u16; 16]>,
         left_luma: Option<[u16; 16]>,
     ) -> Result<(), MacroblockReconstructionError> {
-        let top_left = (mb_x > 0 && mb_y > 0)
-            .then(|| frame.y.get(mb_x * 16 - 1, mb_y * 16 - 1))
-            .flatten();
+        let top_left = if mb_x > 0 && mb_y > 0 {
+            let x = mb_x * 16 - 1;
+            let y = mb_y * 16 - 1;
+            if frame.luma_in_slice(x, y) {
+                frame.y.get(x, y)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if !reconstruct_intra16x16_luma_dc(
             frame,
             mb_x,
@@ -161,15 +169,30 @@ pub fn reconstruct_intra16x16_luma(
     residuals: &[ResidualBlock4x4; 16],
     prediction: [[u16; 16]; 16],
 ) -> bool {
+    let weights = frame.scaling.weight4x4[0];
     let base_x = mb_x.saturating_mul(16);
     let base_y = mb_y.saturating_mul(16);
     if base_x + 16 > frame.y.width || base_y + 16 > frame.y.height {
         return false;
     }
+    let mut nonzero_seen = false;
+    let mut dequant = None;
     for (block_index, residual) in residuals.iter().enumerate() {
         let (block_x, block_y) = luma4x4_position(block_index);
         let block_prediction = prediction_block(&prediction, block_x, block_y);
-        let reconstructed = residual.reconstruct_with_prescaled_dc(qp, block_prediction);
+        let reconstructed = if residual.is_zero() {
+            block_prediction
+        } else if nonzero_seen {
+            let prepared = dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights));
+            residual.reconstruct_classified_with_prescaled_dc_prepared(
+                block_prediction,
+                prepared,
+                residual.is_dc_only(),
+            )
+        } else {
+            nonzero_seen = true;
+            residual.reconstruct_nonzero_with_prescaled_dc_scaled(qp, block_prediction, &weights)
+        };
         let x = base_x + block_x * 4;
         let y = base_y + block_y * 4;
         if !frame.y.write_block(x, y, &reconstructed) {
@@ -186,19 +209,53 @@ pub fn add_luma_residual_16x16(
     qp: u8,
     residuals: &[ResidualBlock4x4; 16],
 ) -> bool {
+    add_luma_residual_16x16_impl(frame, mb_x, mb_y, qp, residuals, false)
+}
+
+pub(crate) fn add_luma_residual_16x16_predequantized(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    residuals: &[ResidualBlock4x4; 16],
+) -> bool {
+    add_luma_residual_16x16_impl(frame, mb_x, mb_y, 0, residuals, true)
+}
+
+fn add_luma_residual_16x16_impl(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    qp: u8,
+    residuals: &[ResidualBlock4x4; 16],
+    predequantized: bool,
+) -> bool {
+    let weights = frame.scaling.weight4x4[3];
+    let mut dequant = None;
     let base_x = mb_x.saturating_mul(16);
     let base_y = mb_y.saturating_mul(16);
     if base_x + 16 > frame.y.width || base_y + 16 > frame.y.height {
         return false;
     }
     for (block_index, residual) in residuals.iter().enumerate() {
+        if residual.is_zero() {
+            continue;
+        }
         let (block_x, block_y) = luma4x4_position(block_index);
         let x = base_x + block_x * 4;
         let y = base_y + block_y * 4;
         let Some(prediction) = read_luma_block(frame, x, y) else {
             return false;
         };
-        let reconstructed = residual.reconstruct_with_prediction(qp, prediction);
+        let dc_only = residual.is_dc_only();
+        let reconstructed = if predequantized {
+            residual.reconstruct_predequantized(prediction, dc_only)
+        } else {
+            residual.reconstruct_classified_with_prediction_prepared(
+                prediction,
+                dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights)),
+                dc_only,
+            )
+        };
         if !frame.y.write_block(x, y, &reconstructed) {
             return false;
         }
@@ -213,6 +270,7 @@ pub fn add_luma_residual_8x8(
     qp: u8,
     residuals: &[ResidualBlock8x8; 4],
 ) -> bool {
+    let weights = frame.scaling.weight8x8[1];
     let base_x = mb_x.saturating_mul(16);
     let base_y = mb_y.saturating_mul(16);
     if base_x + 16 > frame.y.width || base_y + 16 > frame.y.height {
@@ -221,18 +279,172 @@ pub fn add_luma_residual_8x8(
     for block_y in 0..2 {
         for block_x in 0..2 {
             let block_index = block_y * 2 + block_x;
+            if residuals[block_index].is_zero() {
+                continue;
+            }
             let x = base_x + block_x * 8;
             let y = base_y + block_y * 8;
             let Some(prediction) = read_luma8x8_block(frame, x, y) else {
                 return false;
             };
-            let reconstructed = residuals[block_index].reconstruct_with_prediction(qp, prediction);
+            let reconstructed = residuals[block_index]
+                .reconstruct_nonzero_with_prediction_scaled(qp, prediction, &weights);
             if !frame.y.write_block(x, y, &reconstructed) {
                 return false;
             }
         }
     }
     true
+}
+
+pub fn reconstruct_inter_luma_16x16_local(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    qp: u8,
+    residuals: &[ResidualBlock4x4; 16],
+    prediction: &mut [u16; 16 * 16],
+) -> bool {
+    reconstruct_inter_luma_16x16_local_impl(frame, mb_x, mb_y, qp, residuals, prediction, false)
+}
+
+pub(crate) fn reconstruct_inter_luma_16x16_local_predequantized(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    residuals: &[ResidualBlock4x4; 16],
+    prediction: &mut [u16; 16 * 16],
+) -> bool {
+    reconstruct_inter_luma_16x16_local_impl(frame, mb_x, mb_y, 0, residuals, prediction, true)
+}
+
+fn reconstruct_inter_luma_16x16_local_impl(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    qp: u8,
+    residuals: &[ResidualBlock4x4; 16],
+    prediction: &mut [u16; 16 * 16],
+    predequantized: bool,
+) -> bool {
+    let weights = frame.scaling.weight4x4[3];
+    let mut dequant = None;
+    for (block_index, residual) in residuals.iter().enumerate() {
+        if residual.is_zero() {
+            continue;
+        }
+        let (block_x, block_y) = luma4x4_position(block_index);
+        let mut block = [[0_u16; 4]; 4];
+        for row in 0..4 {
+            let start = (block_y * 4 + row) * 16 + block_x * 4;
+            block[row].copy_from_slice(&prediction[start..start + 4]);
+        }
+        let dc_only = residual.is_dc_only();
+        let reconstructed = if predequantized {
+            residual.reconstruct_predequantized(block, dc_only)
+        } else {
+            residual.reconstruct_classified_with_prediction_prepared(
+                block,
+                dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights)),
+                dc_only,
+            )
+        };
+        for row in 0..4 {
+            let start = (block_y * 4 + row) * 16 + block_x * 4;
+            prediction[start..start + 4].copy_from_slice(&reconstructed[row]);
+        }
+    }
+    write_local_luma_16x16(frame, mb_x, mb_y, prediction)
+}
+
+pub fn reconstruct_inter_luma_8x8_local(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    qp: u8,
+    residuals: &[ResidualBlock8x8; 4],
+    prediction: &mut [u16; 16 * 16],
+) -> bool {
+    let weights = frame.scaling.weight8x8[1];
+    for block_y in 0..2 {
+        for block_x in 0..2 {
+            let residual = &residuals[block_y * 2 + block_x];
+            if residual.is_zero() {
+                continue;
+            }
+            let mut block = [[0_u16; 8]; 8];
+            for row in 0..8 {
+                let start = (block_y * 8 + row) * 16 + block_x * 8;
+                block[row].copy_from_slice(&prediction[start..start + 8]);
+            }
+            let reconstructed =
+                residual.reconstruct_nonzero_with_prediction_scaled(qp, block, &weights);
+            for row in 0..8 {
+                let start = (block_y * 8 + row) * 16 + block_x * 8;
+                prediction[start..start + 8].copy_from_slice(&reconstructed[row]);
+            }
+        }
+    }
+    write_local_luma_16x16(frame, mb_x, mb_y, prediction)
+}
+
+pub(crate) fn write_local_luma_16x16(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    prediction: &[u16; 16 * 16],
+) -> bool {
+    let base_x = mb_x.saturating_mul(16);
+    let base_y = mb_y.saturating_mul(16);
+    if base_x + 16 > frame.y.width || base_y + 16 > frame.y.height {
+        return false;
+    }
+    let stride = frame.y.width;
+    let samples = frame.y.samples_mut();
+    for row in 0..16 {
+        let target = (base_y + row) * stride + base_x;
+        samples[target..target + 16].copy_from_slice(&prediction[row * 16..row * 16 + 16]);
+    }
+    true
+}
+
+pub(crate) fn write_local_chroma_8x16(
+    frame: &mut DecodedFrame422P10,
+    plane: ChromaPlane,
+    mb_x: usize,
+    mb_y: usize,
+    prediction: &[u16; 8 * 16],
+) -> bool {
+    let base_x = mb_x.saturating_mul(8);
+    let base_y = mb_y.saturating_mul(16);
+    let plane = match plane {
+        ChromaPlane::Cb => &mut frame.cb,
+        ChromaPlane::Cr => &mut frame.cr,
+    };
+    if base_x + 8 > plane.width || base_y + 16 > plane.height {
+        return false;
+    }
+    let stride = plane.width;
+    let samples = plane.samples_mut();
+    for row in 0..16 {
+        let target = (base_y + row) * stride + base_x;
+        samples[target..target + 8].copy_from_slice(&prediction[row * 8..row * 8 + 8]);
+    }
+    true
+}
+
+/// Stores a completed local Y/Cb/Cr prediction with no residual.
+pub(crate) fn store_local_inter_prediction(
+    frame: &mut DecodedFrame422P10,
+    mb_x: usize,
+    mb_y: usize,
+    luma: &[u16; 16 * 16],
+    cb: &[u16; 8 * 16],
+    cr: &[u16; 8 * 16],
+) -> bool {
+    write_local_luma_16x16(frame, mb_x, mb_y, luma)
+        && write_local_chroma_8x16(frame, ChromaPlane::Cb, mb_x, mb_y, cb)
+        && write_local_chroma_8x16(frame, ChromaPlane::Cr, mb_x, mb_y, cr)
 }
 
 pub fn reconstruct_intra4x4_luma(
@@ -243,17 +455,33 @@ pub fn reconstruct_intra4x4_luma(
     modes: &[Intra4x4PredictionMode; 16],
     residuals: &[ResidualBlock4x4; 16],
 ) -> Result<(), MacroblockReconstructionError> {
+    let weights = frame.scaling.weight4x4[0];
     let base_x = mb_x.saturating_mul(16);
     let base_y = mb_y.saturating_mul(16);
     if base_x + 16 > frame.y.width || base_y + 16 > frame.y.height {
         return Err(MacroblockReconstructionError::OutOfBounds);
     }
+    let mut nonzero_seen = false;
+    let mut dequant = None;
     for block_index in 0..16 {
         let (block_x, block_y) = luma4x4_position(block_index);
         let x = base_x + block_x * 4;
         let y = base_y + block_y * 4;
         let prediction = intra4x4_prediction(frame, x, y, block_index, modes[block_index])?;
-        let reconstructed = residuals[block_index].reconstruct_with_prediction(qp, prediction);
+        let residual = &residuals[block_index];
+        let reconstructed = if residual.is_zero() {
+            prediction
+        } else if nonzero_seen {
+            let prepared = dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights));
+            residual.reconstruct_classified_with_prediction_prepared(
+                prediction,
+                prepared,
+                residual.is_dc_only(),
+            )
+        } else {
+            nonzero_seen = true;
+            residual.reconstruct_nonzero_with_prediction_scaled(qp, prediction, &weights)
+        };
         if !frame.y.write_block(x, y, &reconstructed) {
             return Err(MacroblockReconstructionError::OutOfBounds);
         }
@@ -269,6 +497,7 @@ pub fn reconstruct_intra8x8_luma(
     modes: &[Intra4x4PredictionMode; 4],
     residuals: &[ResidualBlock8x8; 4],
 ) -> Result<(), MacroblockReconstructionError> {
+    let weights = frame.scaling.weight8x8[0];
     let base_x = mb_x.saturating_mul(16);
     let base_y = mb_y.saturating_mul(16);
     if base_x + 16 > frame.y.width || base_y + 16 > frame.y.height {
@@ -280,7 +509,8 @@ pub fn reconstruct_intra8x8_luma(
             let x = base_x + block_x * 8;
             let y = base_y + block_y * 8;
             let prediction = intra8x8_prediction(frame, x, y, block_index, modes[block_index])?;
-            let reconstructed = residuals[block_index].reconstruct_with_prediction(qp, prediction);
+            let reconstructed = residuals[block_index]
+                .reconstruct_nonzero_with_prediction_scaled(qp, prediction, &weights);
             if !frame.y.write_block(x, y, &reconstructed) {
                 return Err(MacroblockReconstructionError::OutOfBounds);
             }
@@ -309,6 +539,13 @@ pub fn reconstruct_chroma_422_intra(
     prediction_mode: u8,
     residuals: &[ResidualBlock4x4; 8],
 ) -> bool {
+    let list = match plane {
+        ChromaPlane::Cb => 1,
+        ChromaPlane::Cr => 2,
+    };
+    let weights = frame.scaling.weight4x4[list];
+    let slice_first_mb = frame.slice_first_mb;
+    let coded_width = frame.coded_width;
     let base_x = mb_x.saturating_mul(8);
     let base_y = mb_y.saturating_mul(16);
     let plane = match plane {
@@ -318,13 +555,38 @@ pub fn reconstruct_chroma_422_intra(
     if base_x + 8 > plane.width || base_y + 16 > plane.height {
         return false;
     }
-    let prediction = chroma_422_prediction(plane, base_x, base_y, prediction_mode);
+    let prediction = chroma_422_prediction(
+        plane,
+        base_x,
+        base_y,
+        prediction_mode,
+        slice_first_mb,
+        coded_width,
+    );
+    let mut nonzero_seen = false;
+    let mut dequant = None;
     for block_y in 0..4 {
         for block_x in 0..2 {
             let block_index = block_y * 2 + block_x;
             let block_prediction = chroma_prediction_block(&prediction, block_x, block_y);
-            let reconstructed =
-                residuals[block_index].reconstruct_with_prescaled_dc(qp, block_prediction);
+            let residual = &residuals[block_index];
+            let reconstructed = if residual.is_zero() {
+                block_prediction
+            } else if nonzero_seen {
+                let prepared = dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights));
+                residual.reconstruct_classified_with_prescaled_dc_prepared(
+                    block_prediction,
+                    prepared,
+                    residual.is_dc_only(),
+                )
+            } else {
+                nonzero_seen = true;
+                residual.reconstruct_nonzero_with_prescaled_dc_scaled(
+                    qp,
+                    block_prediction,
+                    &weights,
+                )
+            };
             let x = base_x + block_x * 4;
             let y = base_y + block_y * 4;
             if !plane.write_block(x, y, &reconstructed) {
@@ -340,8 +602,15 @@ fn chroma_422_prediction(
     base_x: usize,
     base_y: usize,
     prediction_mode: u8,
+    slice_first_mb: u32,
+    coded_width: usize,
 ) -> [[u16; 8]; 16] {
-    let top = if base_y > 0 {
+    let in_slice = |x: usize, y: usize| {
+        let mb_width = (coded_width / 16).max(1);
+        let address = (y / 16).saturating_mul(mb_width) + (x / 8);
+        address >= slice_first_mb as usize
+    };
+    let top = if base_y > 0 && in_slice(base_x, base_y - 1) {
         let mut samples = [0_u16; 8];
         let mut available = true;
         for (index, sample) in samples.iter_mut().enumerate() {
@@ -356,7 +625,7 @@ fn chroma_422_prediction(
     } else {
         None
     };
-    let left = if base_x > 0 {
+    let left = if base_x > 0 && in_slice(base_x - 1, base_y) {
         let mut samples = [0_u16; 16];
         let mut available = true;
         for (index, sample) in samples.iter_mut().enumerate() {
@@ -371,7 +640,7 @@ fn chroma_422_prediction(
     } else {
         None
     };
-    let top_left = if base_x > 0 && base_y > 0 {
+    let top_left = if base_x > 0 && base_y > 0 && in_slice(base_x - 1, base_y - 1) {
         plane.get(base_x - 1, base_y - 1)
     } else {
         None
@@ -471,6 +740,12 @@ pub fn add_chroma_residual_422(
     qp: u8,
     residuals: &[ResidualBlock4x4; 8],
 ) -> bool {
+    let list = match plane {
+        ChromaPlane::Cb => 1,
+        ChromaPlane::Cr => 2,
+    };
+    let weights = frame.scaling.weight4x4[list];
+    let mut dequant = None;
     let base_x = mb_x.saturating_mul(8);
     let base_y = mb_y.saturating_mul(16);
     let plane = match plane {
@@ -483,12 +758,20 @@ pub fn add_chroma_residual_422(
     for block_y in 0..4 {
         for block_x in 0..2 {
             let block_index = block_y * 2 + block_x;
+            if residuals[block_index].is_zero() {
+                continue;
+            }
             let x = base_x + block_x * 4;
             let y = base_y + block_y * 4;
             let Some(prediction) = read_plane_block(plane, x, y) else {
                 return false;
             };
-            let reconstructed = residuals[block_index].reconstruct_with_prediction(qp, prediction);
+            let reconstructed = residuals[block_index]
+                .reconstruct_classified_with_prediction_prepared(
+                    prediction,
+                    dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights)),
+                    residuals[block_index].is_dc_only(),
+                );
             if !plane.write_block(x, y, &reconstructed) {
                 return false;
             }
@@ -504,7 +787,16 @@ pub fn add_chroma_residual_422_prescaled(
     mb_y: usize,
     qp: u8,
     residuals: &[ResidualBlock4x4; 8],
+    intra: bool,
 ) -> bool {
+    let list = match (intra, plane) {
+        (true, ChromaPlane::Cb) => 1,
+        (true, ChromaPlane::Cr) => 2,
+        (false, ChromaPlane::Cb) => 4,
+        (false, ChromaPlane::Cr) => 5,
+    };
+    let weights = frame.scaling.weight4x4[list];
+    let mut dequant = None;
     let base_x = mb_x.saturating_mul(8);
     let base_y = mb_y.saturating_mul(16);
     let plane = match plane {
@@ -517,17 +809,79 @@ pub fn add_chroma_residual_422_prescaled(
     for block_y in 0..4 {
         for block_x in 0..2 {
             let block_index = block_y * 2 + block_x;
+            if residuals[block_index].is_zero() {
+                continue;
+            }
             let x = base_x + block_x * 4;
             let y = base_y + block_y * 4;
             let Some(prediction) = read_plane_block(plane, x, y) else {
                 return false;
             };
-            let reconstructed =
-                residuals[block_index].reconstruct_with_prescaled_dc(qp, prediction);
+            let reconstructed = residuals[block_index]
+                .reconstruct_classified_with_prescaled_dc_prepared(
+                    prediction,
+                    dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights)),
+                    residuals[block_index].is_dc_only(),
+                );
             if !plane.write_block(x, y, &reconstructed) {
                 return false;
             }
         }
+    }
+    true
+}
+
+pub fn reconstruct_inter_chroma_422_local(
+    frame: &mut DecodedFrame422P10,
+    plane_kind: ChromaPlane,
+    mb_x: usize,
+    mb_y: usize,
+    qp: u8,
+    residuals: &[ResidualBlock4x4; 8],
+    prediction: &mut [u16; 8 * 16],
+) -> bool {
+    let list = match plane_kind {
+        ChromaPlane::Cb => 4,
+        ChromaPlane::Cr => 5,
+    };
+    let weights = frame.scaling.weight4x4[list];
+    let mut dequant = None;
+    for block_y in 0..4 {
+        for block_x in 0..2 {
+            let residual = &residuals[block_y * 2 + block_x];
+            if residual.is_zero() {
+                continue;
+            }
+            let mut block = [[0_u16; 4]; 4];
+            for row in 0..4 {
+                let start = (block_y * 4 + row) * 8 + block_x * 4;
+                block[row].copy_from_slice(&prediction[start..start + 4]);
+            }
+            let reconstructed = residual.reconstruct_classified_with_prescaled_dc_prepared(
+                block,
+                dequant.get_or_insert_with(|| prepare_dequant_4x4(qp, &weights)),
+                residual.is_dc_only(),
+            );
+            for row in 0..4 {
+                let start = (block_y * 4 + row) * 8 + block_x * 4;
+                prediction[start..start + 4].copy_from_slice(&reconstructed[row]);
+            }
+        }
+    }
+    let base_x = mb_x.saturating_mul(8);
+    let base_y = mb_y.saturating_mul(16);
+    let plane = match plane_kind {
+        ChromaPlane::Cb => &mut frame.cb,
+        ChromaPlane::Cr => &mut frame.cr,
+    };
+    if base_x + 8 > plane.width || base_y + 16 > plane.height {
+        return false;
+    }
+    let stride = plane.width;
+    let samples = plane.samples_mut();
+    for row in 0..16 {
+        let target = (base_y + row) * stride + base_x;
+        samples[target..target + 8].copy_from_slice(&prediction[row * 8..row * 8 + 8]);
     }
     true
 }
@@ -537,11 +891,15 @@ fn read_luma_block(frame: &DecodedFrame422P10, x: usize, y: usize) -> Option<[[u
 }
 
 fn read_luma8x8_block(frame: &DecodedFrame422P10, x: usize, y: usize) -> Option<[[u16; 8]; 8]> {
+    if x + 8 > frame.y.width || y + 8 > frame.y.height {
+        return None;
+    }
+    let samples = frame.y.samples();
+    let stride = frame.y.width;
     let mut block = [[0_u16; 8]; 8];
     for (row_index, row) in block.iter_mut().enumerate() {
-        for (column_index, sample) in row.iter_mut().enumerate() {
-            *sample = frame.y.get(x + column_index, y + row_index)?;
-        }
+        let start = (y + row_index) * stride + x;
+        row.copy_from_slice(&samples[start..start + 8]);
     }
     Some(block)
 }
@@ -553,7 +911,7 @@ fn intra4x4_prediction(
     block_index: usize,
     mode: Intra4x4PredictionMode,
 ) -> Result<[[u16; 4]; 4], MacroblockReconstructionError> {
-    let top = (y > 0)
+    let top = (y > 0 && frame.luma_in_slice(x, y - 1))
         .then(|| {
             let mut samples = [0_u16; 4];
             for (index, sample) in samples.iter_mut().enumerate() {
@@ -562,7 +920,7 @@ fn intra4x4_prediction(
             Some(samples)
         })
         .flatten();
-    let left = (x > 0)
+    let left = (x > 0 && frame.luma_in_slice(x - 1, y))
         .then(|| {
             let mut samples = [0_u16; 4];
             for (index, sample) in samples.iter_mut().enumerate() {
@@ -751,7 +1109,7 @@ fn intra8x8_prediction(
 ) -> Result<[[u16; 8]; 8], MacroblockReconstructionError> {
     let raw_top_left = top_left_sample(frame, x, y);
     let raw_top16 = top16_samples(frame, x, y, block_index);
-    let raw_left = (x > 0)
+    let raw_left = (x > 0 && frame.luma_in_slice(x - 1, y))
         .then(|| {
             let mut samples = [0_u16; 8];
             for (index, sample) in samples.iter_mut().enumerate() {
@@ -1090,6 +1448,9 @@ fn intra4x4_sample_available(
     if sample_x >= frame.y.width || sample_y >= frame.y.height {
         return false;
     }
+    if !frame.luma_in_slice(sample_x, sample_y) {
+        return false;
+    }
     let mb_x = current_x / 16;
     let mb_y = current_y / 16;
     let sample_mb_x = sample_x / 16;
@@ -1124,7 +1485,7 @@ fn intra4x4_dc_prediction(top: Option<[u16; 4]>, left: Option<[u16; 4]>) -> [[u1
 }
 
 fn top_left_sample(frame: &DecodedFrame422P10, x: usize, y: usize) -> Option<u16> {
-    if x == 0 || y == 0 {
+    if x == 0 || y == 0 || !frame.luma_in_slice(x - 1, y - 1) {
         return None;
     }
     frame.y.get(x - 1, y - 1)
@@ -1175,11 +1536,15 @@ fn read_plane_block(
     x: usize,
     y: usize,
 ) -> Option<[[u16; 4]; 4]> {
+    if x + 4 > plane.width || y + 4 > plane.height {
+        return None;
+    }
+    let samples = plane.samples();
+    let stride = plane.width;
     let mut block = [[0_u16; 4]; 4];
     for (row_index, row) in block.iter_mut().enumerate() {
-        for (column_index, sample) in row.iter_mut().enumerate() {
-            *sample = plane.get(x + column_index, y + row_index)?;
-        }
+        let start = (y + row_index) * stride + x;
+        row.copy_from_slice(&samples[start..start + 4]);
     }
     Some(block)
 }

@@ -1,7 +1,9 @@
-use std::{cell::RefCell, fmt, rc::Rc};
+use std::fmt;
 
 use crate::cabac::{CabacContext, CabacDecoder, CabacError, CabacInitValue};
-use crate::residual::{ResidualBlock4x4, ResidualBlock8x8};
+use crate::residual::{
+    PreparedDequant4x4, ResidualBlock4x4, ResidualBlock8x8, ZIGZAG_4X4, ZIGZAG_8X8,
+};
 use rusty_h264_common::cabac_tables::CTX_INIT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,7 +26,6 @@ pub enum CabacResidualCategory {
 
 #[derive(Clone, Debug)]
 pub struct CabacResidualCategoryContexts {
-    bank: Rc<RefCell<Vec<CabacContext>>>,
     coded_block_flag_base: usize,
     significant_base: usize,
     last_base: usize,
@@ -53,14 +54,11 @@ impl CabacResidual4x4Contexts {
 
 impl CabacResidualCategoryContexts {
     pub fn i_slice(category: CabacResidualCategory, qp_y: u8) -> Self {
-        let bank = i_slice_residual_context_bank(qp_y);
-        Self::i_slice_with_bank(category, bank)
+        let _ = qp_y;
+        Self::new(category)
     }
 
-    pub fn i_slice_with_bank(
-        category: CabacResidualCategory,
-        bank: Rc<RefCell<Vec<CabacContext>>>,
-    ) -> Self {
+    pub fn new(category: CabacResidualCategory) -> Self {
         let coded_block_flag_base = match category {
             CabacResidualCategory::Luma16Dc => 85,
             CabacResidualCategory::Luma16Ac => 89,
@@ -91,7 +89,6 @@ impl CabacResidualCategoryContexts {
         };
 
         Self {
-            bank,
             coded_block_flag_base,
             significant_base,
             last_base,
@@ -99,41 +96,47 @@ impl CabacResidualCategoryContexts {
             chroma422_dc: matches!(category, CabacResidualCategory::Chroma422Dc),
         }
     }
+}
 
-    fn decode_decision(
-        &mut self,
-        decoder: &mut CabacDecoder<'_>,
-        absolute_index: usize,
-    ) -> Result<bool, CabacError> {
-        let mut bank = self.bank.borrow_mut();
-        let context = bank
-            .get_mut(absolute_index)
-            .ok_or(CabacError::MissingContext)?;
-        decoder.decode_decision(context)
+#[inline(always)]
+fn decode_bank_bin(
+    decoder: &mut CabacDecoder<'_>,
+    bank: &mut [CabacContext],
+    absolute_index: usize,
+) -> bool {
+    debug_assert!(absolute_index < bank.len());
+    // Context bases live in 85..=266 and the largest offset used with them is 14.
+    let context = unsafe { bank.get_unchecked_mut(absolute_index) };
+    decoder.decode_bin(context)
+}
+
+#[inline(always)]
+fn ensure_cabac(decoder: &CabacDecoder<'_>) -> Result<(), CabacResidualError> {
+    if decoder.fault() {
+        Err(CabacError::EndOfSlice.into())
+    } else {
+        Ok(())
     }
 }
 
-pub fn i_slice_residual_context_bank(qp_y: u8) -> Rc<RefCell<Vec<CabacContext>>> {
+pub fn i_slice_residual_context_bank(qp_y: u8) -> [CabacContext; 460] {
     let qp = i16::from(qp_y);
-    let mut bank = vec![CabacContext::new(0, false); 460];
+    let mut bank = [CabacContext::new(0, false); 460];
     for index in 85..=275 {
         bank[index] = cabac_i_init(index).initialize(qp);
     }
-    Rc::new(RefCell::new(bank))
+    bank
 }
 
-pub fn pb_slice_residual_context_bank(
-    qp_y: u8,
-    cabac_init_idc: u8,
-) -> Rc<RefCell<Vec<CabacContext>>> {
+pub fn pb_slice_residual_context_bank(qp_y: u8, cabac_init_idc: u8) -> [CabacContext; 460] {
     let qp = i16::from(qp_y);
     let model = usize::from(cabac_init_idc).saturating_add(1).min(3);
-    let mut bank = vec![CabacContext::new(0, false); 460];
+    let mut bank = [CabacContext::new(0, false); 460];
     for index in 85..=275 {
         let (m, n) = CTX_INIT[index][model];
         bank[index] = CabacInitValue::new(m as i8, n as i8).initialize(qp);
     }
-    Rc::new(RefCell::new(bank))
+    bank
 }
 
 impl CabacResidual8x8Contexts {
@@ -172,23 +175,16 @@ impl CabacResidual8x8Contexts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CabacResidualDecodeReport {
-    pub coded: bool,
-    pub non_zero_coefficients: usize,
-    pub last_scan_index: Option<usize>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CabacResidual4x4 {
     pub block: ResidualBlock4x4,
-    pub report: CabacResidualDecodeReport,
+    pub non_zero_coefficients: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CabacResidual8x8 {
     pub block: ResidualBlock8x8,
-    pub report: CabacResidualDecodeReport,
+    pub non_zero_coefficients: u8,
 }
 
 pub fn decode_residual_4x4(
@@ -207,26 +203,52 @@ pub fn decode_residual_4x4_ac(
 
 pub fn decode_residual_4x4_category(
     decoder: &mut CabacDecoder<'_>,
-    contexts: &mut CabacResidualCategoryContexts,
+    bank: &mut [CabacContext],
+    contexts: &CabacResidualCategoryContexts,
     coded_block_context: usize,
 ) -> Result<CabacResidual4x4, CabacResidualError> {
-    decode_residual_category_subset(decoder, contexts, coded_block_context, 0, 16)
+    decode_residual_category_subset(decoder, bank, contexts, coded_block_context, 0, 16)
+}
+
+pub(crate) fn decode_residual_4x4_category_dequantized(
+    decoder: &mut CabacDecoder<'_>,
+    bank: &mut [CabacContext],
+    contexts: &CabacResidualCategoryContexts,
+    coded_block_context: usize,
+    prepared: &PreparedDequant4x4,
+) -> Result<CabacResidual4x4, CabacResidualError> {
+    let residual = decode_residual_category_levels(
+        decoder,
+        bank,
+        contexts,
+        coded_block_context,
+        0,
+        16,
+        Some(prepared),
+    )?;
+    Ok(CabacResidual4x4 {
+        block: ResidualBlock4x4::from_raster_array(residual.levels),
+        non_zero_coefficients: residual.non_zero_coefficients,
+    })
 }
 
 pub fn decode_residual_4x4_ac_category(
     decoder: &mut CabacDecoder<'_>,
-    contexts: &mut CabacResidualCategoryContexts,
+    bank: &mut [CabacContext],
+    contexts: &CabacResidualCategoryContexts,
     coded_block_context: usize,
 ) -> Result<CabacResidual4x4, CabacResidualError> {
-    decode_residual_category_subset(decoder, contexts, coded_block_context, 1, 15)
+    decode_residual_category_subset(decoder, bank, contexts, coded_block_context, 1, 15)
 }
 
 pub fn decode_residual_chroma422_dc_category(
     decoder: &mut CabacDecoder<'_>,
-    contexts: &mut CabacResidualCategoryContexts,
+    bank: &mut [CabacContext],
+    contexts: &CabacResidualCategoryContexts,
     coded_block_context: usize,
 ) -> Result<CabacResidual4x4, CabacResidualError> {
-    let residual = decode_residual_category_levels(decoder, contexts, coded_block_context, 0, 8)?;
+    let residual =
+        decode_residual_category_levels(decoder, bank, contexts, coded_block_context, 0, 8, None)?;
     let mut compact = [0_i32; 16];
     for (scan_index, level) in residual.levels.iter().copied().enumerate() {
         if scan_index >= CHROMA422_DC_SCAN.len() {
@@ -236,28 +258,36 @@ pub fn decode_residual_chroma422_dc_category(
         compact[row * 4 + column] = level;
     }
     Ok(CabacResidual4x4 {
-        block: ResidualBlock4x4::from_raster(&compact),
-        report: residual.report,
+        block: ResidualBlock4x4::from_raster_array(compact),
+        non_zero_coefficients: residual.non_zero_coefficients,
     })
 }
 
+#[inline(never)]
 pub fn decode_residual_8x8(
     decoder: &mut CabacDecoder<'_>,
     contexts: &mut CabacResidual8x8Contexts,
 ) -> Result<CabacResidual8x8, CabacResidualError> {
-    let mut significant = Vec::new();
+    let mut significant = [0_usize; 64];
+    let mut significant_len = 0_usize;
     for local_scan_index in 0..63 {
         let significant_context = SIGNIFICANT_COEFF_FLAG_OFFSET_8X8[local_scan_index].min(14);
-        if decoder.decode_decision(&mut contexts.significant_coeff_flag[significant_context])? {
-            significant.push(local_scan_index);
+        if decoder.decode_bin(&mut contexts.significant_coeff_flag[significant_context]) {
+            significant[significant_len] = local_scan_index;
+            significant_len += 1;
             let last_context = LAST_COEFF_FLAG_OFFSET_8X8[local_scan_index].min(8);
-            if decoder.decode_decision(&mut contexts.last_significant_coeff_flag[last_context])? {
-                return decode_significant_levels_8x8(decoder, contexts, significant);
+            if decoder.decode_bin(&mut contexts.last_significant_coeff_flag[last_context]) {
+                return decode_significant_levels_8x8(
+                    decoder,
+                    contexts,
+                    &significant[..significant_len],
+                );
             }
         }
     }
-    significant.push(63);
-    decode_significant_levels_8x8(decoder, contexts, significant)
+    significant[significant_len] = 63;
+    significant_len += 1;
+    decode_significant_levels_8x8(decoder, contexts, &significant[..significant_len])
 }
 
 fn decode_residual_4x4_subset(
@@ -269,90 +299,114 @@ fn decode_residual_4x4_subset(
     if !decoder.decode_decision(&mut contexts.coded_block_flag)? {
         return Ok(CabacResidual4x4 {
             block: ResidualBlock4x4::zero(),
-            report: CabacResidualDecodeReport {
-                coded: false,
-                non_zero_coefficients: 0,
-                last_scan_index: None,
-            },
+            non_zero_coefficients: 0,
         });
     }
 
-    let mut significant = Vec::new();
+    let mut significant = [0_usize; 16];
+    let mut significant_len = 0_usize;
     for local_scan_index in 0..max_coeff.saturating_sub(1) {
         let context_index =
             local_scan_index.min(contexts.significant_coeff_flag.len().saturating_sub(1));
         if decoder.decode_decision(&mut contexts.significant_coeff_flag[context_index])? {
-            significant.push(scan_offset + local_scan_index);
+            significant[significant_len] = scan_offset + local_scan_index;
+            significant_len += 1;
             if decoder.decode_decision(&mut contexts.last_significant_coeff_flag[context_index])? {
-                return decode_significant_levels(decoder, contexts, significant);
+                return decode_significant_levels(
+                    decoder,
+                    contexts,
+                    &significant[..significant_len],
+                );
             }
         }
     }
-    significant.push(scan_offset + max_coeff.saturating_sub(1));
-    decode_significant_levels(decoder, contexts, significant)
+    significant[significant_len] = scan_offset + max_coeff.saturating_sub(1);
+    significant_len += 1;
+    decode_significant_levels(decoder, contexts, &significant[..significant_len])
 }
 
 fn decode_residual_category_subset(
     decoder: &mut CabacDecoder<'_>,
-    contexts: &mut CabacResidualCategoryContexts,
+    bank: &mut [CabacContext],
+    contexts: &CabacResidualCategoryContexts,
     coded_block_context: usize,
     scan_offset: usize,
     max_coeff: usize,
 ) -> Result<CabacResidual4x4, CabacResidualError> {
     let residual = decode_residual_category_levels(
         decoder,
+        bank,
         contexts,
         coded_block_context,
         scan_offset,
         max_coeff,
+        None,
     )?;
     Ok(CabacResidual4x4 {
-        block: ResidualBlock4x4::from_zigzag(&residual.levels),
-        report: residual.report,
+        block: ResidualBlock4x4::from_raster_array(residual.levels),
+        non_zero_coefficients: residual.non_zero_coefficients,
     })
 }
 
 struct CabacResidualLevels4x4 {
     levels: [i32; 16],
-    report: CabacResidualDecodeReport,
+    non_zero_coefficients: u8,
 }
 
+#[inline(never)]
 fn decode_residual_category_levels(
     decoder: &mut CabacDecoder<'_>,
-    contexts: &mut CabacResidualCategoryContexts,
+    bank: &mut [CabacContext],
+    contexts: &CabacResidualCategoryContexts,
     coded_block_context: usize,
     scan_offset: usize,
     max_coeff: usize,
+    prepared: Option<&PreparedDequant4x4>,
 ) -> Result<CabacResidualLevels4x4, CabacResidualError> {
     let coded_block_context = coded_block_context.min(3);
-    if !contexts.decode_decision(
-        decoder,
-        contexts.coded_block_flag_base + coded_block_context,
-    )? {
+    let coded_block_flag_base = contexts.coded_block_flag_base;
+    let significant_base = contexts.significant_base;
+    let last_base = contexts.last_base;
+    let abs_base = contexts.abs_base;
+    let chroma422_dc = contexts.chroma422_dc;
+    if !decode_bank_bin(decoder, bank, coded_block_flag_base + coded_block_context) {
+        ensure_cabac(decoder)?;
         return Ok(CabacResidualLevels4x4 {
             levels: [0; 16],
-            report: CabacResidualDecodeReport {
-                coded: false,
-                non_zero_coefficients: 0,
-                last_scan_index: None,
-            },
+            non_zero_coefficients: 0,
         });
     }
 
-    let mut significant = Vec::new();
+    let mut significant = [0_usize; 16];
+    let mut significant_len = 0_usize;
     for local_scan_index in 0..max_coeff.saturating_sub(1) {
         let scan_index = scan_offset + local_scan_index;
-        let context_index =
-            significant_context_index(contexts.chroma422_dc, local_scan_index).min(14);
-        if contexts.decode_decision(decoder, contexts.significant_base + context_index)? {
-            significant.push(scan_index);
-            if contexts.decode_decision(decoder, contexts.last_base + context_index)? {
-                return decode_significant_level_values_category(decoder, contexts, significant);
+        let context_index = significant_context_index(chroma422_dc, local_scan_index).min(14);
+        if decode_bank_bin(decoder, bank, significant_base + context_index) {
+            significant[significant_len] = scan_index;
+            significant_len += 1;
+            if decode_bank_bin(decoder, bank, last_base + context_index) {
+                return decode_significant_level_values_category(
+                    decoder,
+                    bank,
+                    abs_base,
+                    chroma422_dc,
+                    &significant[..significant_len],
+                    prepared,
+                );
             }
         }
     }
-    significant.push(scan_offset + max_coeff.saturating_sub(1));
-    decode_significant_level_values_category(decoder, contexts, significant)
+    significant[significant_len] = scan_offset + max_coeff.saturating_sub(1);
+    significant_len += 1;
+    decode_significant_level_values_category(
+        decoder,
+        bank,
+        abs_base,
+        chroma422_dc,
+        &significant[..significant_len],
+        prepared,
+    )
 }
 
 fn significant_context_index(chroma422_dc: bool, scan_index: usize) -> usize {
@@ -370,7 +424,7 @@ fn significant_context_index(chroma422_dc: bool, scan_index: usize) -> usize {
 fn decode_significant_levels(
     decoder: &mut CabacDecoder<'_>,
     contexts: &mut CabacResidual4x4Contexts,
-    significant: Vec<usize>,
+    significant: &[usize],
 ) -> Result<CabacResidual4x4, CabacResidualError> {
     let mut levels = [0_i32; 16];
     let mut decoded_abs_level_eq1 = 0_u32;
@@ -387,7 +441,8 @@ fn decode_significant_levels(
             .checked_add(1)
             .ok_or(CabacResidualError::LevelOverflow)?;
         let sign = if decoder.decode_bypass()? { -1 } else { 1 };
-        levels[scan_index] =
+        let (row, column) = ZIGZAG_4X4[scan_index];
+        levels[row * 4 + column] =
             i32::try_from(abs_level).map_err(|_| CabacResidualError::LevelOverflow)? * sign;
 
         if abs_level == 1 {
@@ -397,33 +452,31 @@ fn decode_significant_levels(
         }
     }
 
-    let mut zigzag_levels = [0_i32; 16];
-    zigzag_levels.copy_from_slice(&levels);
     Ok(CabacResidual4x4 {
-        block: ResidualBlock4x4::from_zigzag(&zigzag_levels),
-        report: CabacResidualDecodeReport {
-            coded: true,
-            non_zero_coefficients: significant.len(),
-            last_scan_index: significant.last().copied(),
-        },
+        block: ResidualBlock4x4::from_raster_array(levels),
+        non_zero_coefficients: significant.len() as u8,
     })
 }
 
+#[inline(always)]
 fn decode_significant_level_values_category(
     decoder: &mut CabacDecoder<'_>,
-    contexts: &mut CabacResidualCategoryContexts,
-    significant: Vec<usize>,
+    bank: &mut [CabacContext],
+    abs_base: usize,
+    chroma422_dc: bool,
+    significant: &[usize],
+    prepared: Option<&PreparedDequant4x4>,
 ) -> Result<CabacResidualLevels4x4, CabacResidualError> {
     let mut levels = [0_i32; 16];
     let mut node_context = 0_usize;
 
     for scan_index in significant.iter().rev().copied() {
         let first_context = COEFF_ABS_LEVEL1_CTX[node_context];
-        let abs_level = if !contexts.decode_decision(decoder, contexts.abs_base + first_context)? {
+        let abs_level = if !decode_bank_bin(decoder, bank, abs_base + first_context) {
             node_context = COEFF_ABS_LEVEL_TRANSITION[0][node_context];
             1_u32
         } else {
-            let follow_context = if contexts.chroma422_dc {
+            let follow_context = if chroma422_dc {
                 COEFF_ABS_LEVELGT1_CTX_422DC[node_context]
             } else {
                 COEFF_ABS_LEVELGT1_CTX[node_context]
@@ -431,26 +484,32 @@ fn decode_significant_level_values_category(
             let coeff_abs = 2_u32
                 .checked_add(decode_ueg0_level_category(
                     decoder,
-                    contexts,
-                    contexts.abs_base + follow_context,
+                    bank,
+                    abs_base + follow_context,
                 )?)
                 .ok_or(CabacResidualError::LevelOverflow)?;
             node_context = COEFF_ABS_LEVEL_TRANSITION[1][node_context];
             coeff_abs
         };
 
-        let sign = if decoder.decode_bypass()? { -1 } else { 1 };
-        levels[scan_index] =
-            i32::try_from(abs_level).map_err(|_| CabacResidualError::LevelOverflow)? * sign;
+        let sign = if decoder.decode_bypass_bin() { -1 } else { 1 };
+        let level = i32::try_from(abs_level).map_err(|_| CabacResidualError::LevelOverflow)? * sign;
+        if chroma422_dc {
+            levels[scan_index] = level;
+        } else {
+            let (row, column) = ZIGZAG_4X4[scan_index];
+            levels[row * 4 + column] = if let Some(prepared) = prepared {
+                prepared.scale_coefficient(row, column, level)
+            } else {
+                level
+            };
+        }
     }
 
+    ensure_cabac(decoder)?;
     Ok(CabacResidualLevels4x4 {
         levels,
-        report: CabacResidualDecodeReport {
-            coded: true,
-            non_zero_coefficients: significant.len(),
-            last_scan_index: significant.last().copied(),
-        },
+        non_zero_coefficients: significant.len() as u8,
     })
 }
 
@@ -471,10 +530,11 @@ const CHROMA422_DC_SCAN: [(usize, usize); 8] = [
     (3, 1),
 ];
 
+#[inline(always)]
 fn decode_significant_levels_8x8(
     decoder: &mut CabacDecoder<'_>,
     contexts: &mut CabacResidual8x8Contexts,
-    significant: Vec<usize>,
+    significant: &[usize],
 ) -> Result<CabacResidual8x8, CabacResidualError> {
     let mut levels = [0_i32; 64];
     let mut node_context = 0_usize;
@@ -482,7 +542,7 @@ fn decode_significant_levels_8x8(
     for scan_index in significant.iter().rev().copied() {
         let abs_level_minus1_first_context = COEFF_ABS_LEVEL1_CTX_8X8[node_context];
         let abs_level = if !decoder
-            .decode_decision(&mut contexts.coeff_abs_level_minus1[abs_level_minus1_first_context])?
+            .decode_bin(&mut contexts.coeff_abs_level_minus1[abs_level_minus1_first_context])
         {
             node_context = COEFF_ABS_LEVEL_TRANSITION_8X8[0][node_context];
             1_u32
@@ -498,18 +558,16 @@ fn decode_significant_levels_8x8(
             coeff_abs
         };
 
-        let sign = if decoder.decode_bypass()? { -1 } else { 1 };
-        levels[scan_index] =
+        let sign = if decoder.decode_bypass_bin() { -1 } else { 1 };
+        let (row, column) = ZIGZAG_8X8[scan_index];
+        levels[row * 8 + column] =
             i32::try_from(abs_level).map_err(|_| CabacResidualError::LevelOverflow)? * sign;
     }
 
+    ensure_cabac(decoder)?;
     Ok(CabacResidual8x8 {
-        block: ResidualBlock8x8::from_zigzag(&levels),
-        report: CabacResidualDecodeReport {
-            coded: true,
-            non_zero_coefficients: significant.len(),
-            last_scan_index: significant.last().copied(),
-        },
+        block: ResidualBlock8x8::from_raster_array(levels),
+        non_zero_coefficients: significant.len() as u8,
     })
 }
 
@@ -529,13 +587,14 @@ const COEFF_ABS_LEVELGT1_CTX_8X8: [usize; 8] = [5, 5, 5, 5, 6, 7, 8, 9];
 const COEFF_ABS_LEVEL_TRANSITION_8X8: [[usize; 8]; 2] =
     [[1, 2, 3, 3, 4, 5, 6, 7], [4, 4, 4, 4, 5, 6, 7, 7]];
 
+#[inline(always)]
 fn decode_ueg0_level(
     decoder: &mut CabacDecoder<'_>,
     context: &mut CabacContext,
 ) -> Result<u32, CabacResidualError> {
     let mut coeff_abs = 2_u32;
     while coeff_abs < 15 {
-        if !decoder.decode_decision(context)? {
+        if !decoder.decode_bin(context) {
             return coeff_abs
                 .checked_sub(2)
                 .ok_or(CabacResidualError::LevelOverflow);
@@ -547,14 +606,15 @@ fn decode_ueg0_level(
     decode_large_coeff_abs_level_minus2(decoder)
 }
 
+#[inline(always)]
 fn decode_ueg0_level_category(
     decoder: &mut CabacDecoder<'_>,
-    contexts: &mut CabacResidualCategoryContexts,
+    bank: &mut [CabacContext],
     absolute_index: usize,
 ) -> Result<u32, CabacResidualError> {
     let mut coeff_abs = 2_u32;
     while coeff_abs < 15 {
-        if !contexts.decode_decision(decoder, absolute_index)? {
+        if !decode_bank_bin(decoder, bank, absolute_index) {
             return coeff_abs
                 .checked_sub(2)
                 .ok_or(CabacResidualError::LevelOverflow);
@@ -566,11 +626,12 @@ fn decode_ueg0_level_category(
     decode_large_coeff_abs_level_minus2(decoder)
 }
 
+#[inline(never)]
 fn decode_large_coeff_abs_level_minus2(
     decoder: &mut CabacDecoder<'_>,
 ) -> Result<u32, CabacResidualError> {
     let mut suffix_len = 0_u32;
-    while decoder.decode_bypass()? && suffix_len < 23 {
+    while decoder.decode_bypass_bin() && suffix_len < 23 {
         suffix_len = suffix_len
             .checked_add(1)
             .ok_or(CabacResidualError::LevelOverflow)?;
@@ -582,13 +643,14 @@ fn decode_large_coeff_abs_level_minus2(
         coeff_abs = coeff_abs
             .checked_add(coeff_abs)
             .ok_or(CabacResidualError::LevelOverflow)?;
-        if decoder.decode_bypass()? {
+        if decoder.decode_bypass_bin() {
             coeff_abs = coeff_abs
                 .checked_add(1)
                 .ok_or(CabacResidualError::LevelOverflow)?;
         }
     }
 
+    ensure_cabac(decoder)?;
     coeff_abs
         .checked_add(14)
         .and_then(|value| value.checked_sub(2))
@@ -937,8 +999,7 @@ mod tests {
 
         let residual = decode_residual_4x4(&mut decoder, &mut contexts).unwrap();
 
-        assert!(!residual.report.coded);
-        assert_eq!(residual.report.non_zero_coefficients, 0);
+        assert_eq!(residual.non_zero_coefficients, 0);
         assert_eq!(residual.block, ResidualBlock4x4::zero());
     }
 
@@ -951,8 +1012,7 @@ mod tests {
 
         let residual = decode_residual_4x4(&mut decoder, &mut contexts).unwrap();
 
-        assert!(residual.report.coded);
-        assert_eq!(residual.report.non_zero_coefficients, 1);
+        assert_eq!(residual.non_zero_coefficients, 1);
         let (row, column) = ZIGZAG_4X4[0];
         assert_ne!(residual.block.coeffs[row][column], 0);
     }
@@ -986,8 +1046,7 @@ mod tests {
 
         let residual = decode_residual_8x8(&mut decoder, &mut contexts).unwrap();
 
-        assert!(residual.report.coded);
-        assert_eq!(residual.report.non_zero_coefficients, 1);
+        assert_eq!(residual.non_zero_coefficients, 1);
         assert_ne!(residual.block.coeffs[0][0], 0);
     }
 

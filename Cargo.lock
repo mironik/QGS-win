@@ -1504,9 +1504,12 @@ dependencies = [
 name = "qgs-h264-422p10"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "qgs-codec-h264",
  "qgs-protocol",
  "rusty_h264-common",
+ "smallvec",
+ "wide",
 ]
 
 [[package]]

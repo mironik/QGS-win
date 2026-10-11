@@ -87,7 +87,7 @@ struct DeblockSlice {
     list1: Vec<(u16, i32)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct DeblockMb {
     present: bool,
     qp_y: i16,
@@ -184,6 +184,9 @@ impl DeblockGrid {
     }
 
     pub(crate) fn apply(&self, frame: &mut DecodedFrame422P10, motion: &MotionField) {
+        if self.slices.iter().all(|slice| slice.disable_idc == 1) {
+            return;
+        }
         for mb_y in 0..self.height {
             for mb_x in 0..self.width {
                 self.filter_macroblock(frame, motion, mb_x, mb_y);
@@ -198,19 +201,26 @@ impl DeblockGrid {
         mb_x: u32,
         mb_y: u32,
     ) {
-        let Some(mb) = self.mb_at(mb_x as i32, mb_y as i32).cloned() else {
+        let Some(mb) = self.mb_at(mb_x as i32, mb_y as i32).copied() else {
             return;
         };
         if !mb.present {
+            return;
+        }
+        if self
+            .slices
+            .get(mb.slice as usize)
+            .is_some_and(|slice| slice.disable_idc == 1)
+        {
             return;
         }
         for edge in 0..4 {
             let strengths = self.edge_strengths(motion, mb_x, mb_y, edge, true);
             let boundary = edge == 0;
             let neighbor = if boundary {
-                self.mb_at(mb_x as i32 - 1, mb_y as i32).cloned()
+                self.mb_at(mb_x as i32 - 1, mb_y as i32).copied()
             } else {
-                Some(mb.clone())
+                Some(mb)
             };
             if self.edge_allowed(&mb, neighbor.as_ref(), boundary) {
                 let qp = edge_qp(
@@ -264,9 +274,9 @@ impl DeblockGrid {
             let strengths = self.edge_strengths(motion, mb_x, mb_y, edge, false);
             let boundary = edge == 0;
             let neighbor = if boundary {
-                self.mb_at(mb_x as i32, mb_y as i32 - 1).cloned()
+                self.mb_at(mb_x as i32, mb_y as i32 - 1).copied()
             } else {
-                Some(mb.clone())
+                Some(mb)
             };
             if !self.edge_allowed(&mb, neighbor.as_ref(), boundary) {
                 continue;

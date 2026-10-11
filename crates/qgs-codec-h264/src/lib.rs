@@ -8,7 +8,9 @@ use h264_reader::nal::slice::{
     DecRefPicMarking, FieldPic, MemoryManagementControlOperation, ModificationOfPicNums,
     NumRefIdxActive, PicOrderCountLsb, RefPicListModifications, SliceFamily, SliceHeader,
 };
-use h264_reader::nal::sps::{ChromaFormat, FrameMbsFlags, PicOrderCntType, Profile};
+use h264_reader::nal::sps::{
+    ChromaFormat, FrameMbsFlags, PicOrderCntType, Profile, ScalingLists8x8Resolved,
+};
 use h264_reader::nal::{Nal, RefNal, UnitType};
 use h264_reader::rbsp::{BitRead, BitReaderError, Integer, Primitive};
 use h264_reader::Context;
@@ -1094,9 +1096,36 @@ fn parsed_picture(
         frame_num: first_header.frame_num,
         top_field_order_cnt,
         bottom_field_order_cnt,
-        scaling_list4x4: [[16; 16]; 6],
-        scaling_list8x8: [[16; 64]; 2],
+        scaling_list4x4: scaling_list4x4(sps, pps),
+        scaling_list8x8: scaling_list8x8(sps, pps),
     })
+}
+
+fn scaling_list4x4(
+    sps: &h264_reader::nal::sps::SeqParameterSet,
+    pps: &PicParameterSet,
+) -> [[u8; 16]; 6] {
+    pps.extension
+        .as_ref()
+        .and_then(|extension| extension.pic_scaling_matrix.as_ref())
+        .map(|matrix| matrix.scaling_lists_4x4(&sps.chroma_info))
+        .unwrap_or_else(|| sps.chroma_info.scaling_lists_4x4())
+}
+
+fn scaling_list8x8(
+    sps: &h264_reader::nal::sps::SeqParameterSet,
+    pps: &PicParameterSet,
+) -> [[u8; 64]; 2] {
+    let resolved = pps
+        .extension
+        .as_ref()
+        .and_then(|extension| extension.pic_scaling_matrix.as_ref())
+        .and_then(|matrix| matrix.scaling_lists_8x8(&sps.chroma_info))
+        .unwrap_or_else(|| sps.chroma_info.scaling_lists_8x8());
+    match resolved {
+        ScalingLists8x8Resolved::Y(lists) => lists,
+        ScalingLists8x8Resolved::YCbCr(lists) => [lists[0], lists[1]],
+    }
 }
 
 fn surface_desc_from_sps(

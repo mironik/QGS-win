@@ -7,32 +7,31 @@ const NORM_ADJUST_4X4_DC: [i32; 6] = [10, 11, 13, 14, 16, 18];
 pub fn inverse_transform_4x4(coeffs: [[i32; 4]; 4], pred: [[u16; 4]; 4]) -> [[u16; 4]; 4] {
     let mut tmp = [[0_i32; 4]; 4];
     for i in 0..4 {
-        let a0 = coeffs[i][0].saturating_add(coeffs[i][2]);
-        let a1 = coeffs[i][0].saturating_sub(coeffs[i][2]);
-        let a2 = (coeffs[i][1] >> 1).saturating_sub(coeffs[i][3]);
-        let a3 = coeffs[i][1].saturating_add(coeffs[i][3] >> 1);
-        tmp[i][0] = a0.saturating_add(a3);
-        tmp[i][1] = a1.saturating_add(a2);
-        tmp[i][2] = a1.saturating_sub(a2);
-        tmp[i][3] = a0.saturating_sub(a3);
+        let a0 = coeffs[i][0].wrapping_add(coeffs[i][2]);
+        let a1 = coeffs[i][0].wrapping_sub(coeffs[i][2]);
+        let a2 = (coeffs[i][1] >> 1).wrapping_sub(coeffs[i][3]);
+        let a3 = coeffs[i][1].wrapping_add(coeffs[i][3] >> 1);
+        tmp[i][0] = a0.wrapping_add(a3);
+        tmp[i][1] = a1.wrapping_add(a2);
+        tmp[i][2] = a1.wrapping_sub(a2);
+        tmp[i][3] = a0.wrapping_sub(a3);
     }
 
     let mut out = [[0_u16; 4]; 4];
     for i in 0..4 {
-        let a0 = tmp[0][i].saturating_add(tmp[2][i]);
-        let a1 = tmp[0][i].saturating_sub(tmp[2][i]);
-        let a2 = (tmp[1][i] >> 1).saturating_sub(tmp[3][i]);
-        let a3 = tmp[1][i].saturating_add(tmp[3][i] >> 1);
+        let a0 = tmp[0][i].wrapping_add(tmp[2][i]);
+        let a1 = tmp[0][i].wrapping_sub(tmp[2][i]);
+        let a2 = (tmp[1][i] >> 1).wrapping_sub(tmp[3][i]);
+        let a3 = tmp[1][i].wrapping_add(tmp[3][i] >> 1);
         let residuals = [
-            a0.saturating_add(a3),
-            a1.saturating_add(a2),
-            a1.saturating_sub(a2),
-            a0.saturating_sub(a3),
+            a0.wrapping_add(a3),
+            a1.wrapping_add(a2),
+            a1.wrapping_sub(a2),
+            a0.wrapping_sub(a3),
         ];
         for row in 0..4 {
-            out[row][i] = clip10(
-                i32::from(pred[row][i]).saturating_add((residuals[row].saturating_add(32)) >> 6),
-            );
+            out[row][i] =
+                clip10(i32::from(pred[row][i]).wrapping_add(residuals[row].wrapping_add(32) >> 6));
         }
     }
     out
@@ -90,16 +89,24 @@ fn inverse_transform_8x8_1d(input: [i32; 8]) -> [i32; 8] {
 }
 
 pub fn inverse_intra16x16_dc_transform(levels: [[i32; 4]; 4], qp: u8) -> [[i32; 4]; 4] {
+    inverse_intra16x16_dc_transform_weighted(levels, qp, 16)
+}
+
+pub fn inverse_intra16x16_dc_transform_weighted(
+    levels: [[i32; 4]; 4],
+    qp: u8,
+    dc_weight: i32,
+) -> [[i32; 4]; 4] {
     let transformed = hadamard_4x4(levels);
     let qp = i32::from(qp).clamp(0, 63);
     std::array::from_fn(|row| {
-        std::array::from_fn(|column| scale_dc_coefficient(transformed[row][column], qp))
+        std::array::from_fn(|column| scale_dc_coefficient(transformed[row][column], qp, dc_weight))
     })
 }
 
-fn scale_dc_coefficient(transformed: i32, qp: i32) -> i32 {
+fn scale_dc_coefficient(transformed: i32, qp: i32, dc_weight: i32) -> i32 {
     let qbits = qp / 6;
-    let level_scale = i64::from(16 * NORM_ADJUST_4X4_DC[(qp % 6) as usize]);
+    let level_scale = i64::from(dc_weight) * i64::from(NORM_ADJUST_4X4_DC[(qp % 6) as usize]);
     let value = i64::from(transformed) * level_scale;
     let scaled = if qp >= 36 {
         value << (qbits - 6)
@@ -110,6 +117,14 @@ fn scale_dc_coefficient(transformed: i32, qp: i32) -> i32 {
 }
 
 pub fn inverse_chroma422_dc_transform(levels: [[i32; 2]; 4], qp: u8) -> [[i32; 2]; 4] {
+    inverse_chroma422_dc_transform_weighted(levels, qp, 16)
+}
+
+pub fn inverse_chroma422_dc_transform_weighted(
+    levels: [[i32; 2]; 4],
+    qp: u8,
+    dc_weight: i32,
+) -> [[i32; 2]; 4] {
     let mut horizontal = [[0_i32; 2]; 4];
     for row in 0..4 {
         horizontal[row][0] = levels[row][0] + levels[row][1];
@@ -131,7 +146,9 @@ pub fn inverse_chroma422_dc_transform(levels: [[i32; 2]; 4], qp: u8) -> [[i32; 2
     let qp = i32::from(qp).clamp(0, 63);
     let qp_dc = qp + 3;
     std::array::from_fn(|row| {
-        std::array::from_fn(|column| scale_dc_coefficient(transformed[row][column], qp_dc))
+        std::array::from_fn(|column| {
+            scale_dc_coefficient(transformed[row][column], qp_dc, dc_weight)
+        })
     })
 }
 
