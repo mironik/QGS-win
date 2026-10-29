@@ -3712,10 +3712,7 @@ impl SonyBInterCommand {
             }
         }
         let luma_ok = match &residual.luma {
-            InterLumaResidual::Absent => {
-                let zero = std::array::from_fn(|_| ResidualBlock4x4::zero());
-                reconstruct_inter_luma_16x16_local(target, x, y, residual.qp_y, &zero, &mut luma)
-            }
+            InterLumaResidual::Absent => write_local_luma_16x16(target, x, y, &luma),
             InterLumaResidual::Blocks4x4(blocks) => {
                 reconstruct_inter_luma_16x16_local(target, x, y, residual.qp_y, blocks, &mut luma)
             }
@@ -3729,31 +3726,29 @@ impl SonyBInterCommand {
         if !luma_ok {
             return Err(MacroblockReconstructionError::OutOfBounds.into());
         }
-        let zero;
-        let (cb_residual, cr_residual) = if let Some((cb_residual, cr_residual)) = &residual.chroma
-        {
-            (cb_residual, cr_residual)
+        let chroma_ok = if let Some((cb_residual, cr_residual)) = &residual.chroma {
+            reconstruct_inter_chroma_422_local(
+                target,
+                ChromaPlane::Cb,
+                x,
+                y,
+                residual.qp_cb,
+                cb_residual,
+                &mut cb,
+            ) && reconstruct_inter_chroma_422_local(
+                target,
+                ChromaPlane::Cr,
+                x,
+                y,
+                residual.qp_cr,
+                cr_residual,
+                &mut cr,
+            )
         } else {
-            zero = std::array::from_fn(|_| ResidualBlock4x4::zero());
-            (&zero, &zero)
+            write_local_chroma_8x16(target, ChromaPlane::Cb, x, y, &cb)
+                && write_local_chroma_8x16(target, ChromaPlane::Cr, x, y, &cr)
         };
-        if !reconstruct_inter_chroma_422_local(
-            target,
-            ChromaPlane::Cb,
-            x,
-            y,
-            residual.qp_cb,
-            cb_residual,
-            &mut cb,
-        ) || !reconstruct_inter_chroma_422_local(
-            target,
-            ChromaPlane::Cr,
-            x,
-            y,
-            residual.qp_cr,
-            cr_residual,
-            &mut cr,
-        ) {
+        if !chroma_ok {
             return Err(MacroblockReconstructionError::OutOfBounds.into());
         }
         Ok(())

@@ -97,17 +97,21 @@ fn respond(
         WireMessage::CreateDecoder { .. }
         | WireMessage::SubmitAccessUnit { .. }
         | WireMessage::FlushDecoder { .. }
-        | WireMessage::DestroyDecoder { .. } => {
-            session_or(session, request_id, ProtocolErrorCode::UnsupportedDecodeConfiguration)
-        }
+        | WireMessage::DestroyDecoder { .. } => session_or(
+            session,
+            request_id,
+            ProtocolErrorCode::UnsupportedDecodeConfiguration,
+        ),
         WireMessage::CreateBuffer { .. }
         | WireMessage::CreateImage { .. }
         | WireMessage::DestroyResource { .. }
         | WireMessage::ExportResource { .. }
         | WireMessage::CreateSync { .. }
-        | WireMessage::ExportSync { .. } => {
-            session_or(session, request_id, ProtocolErrorCode::UnsupportedExternalHandleType)
-        }
+        | WireMessage::ExportSync { .. } => session_or(
+            session,
+            request_id,
+            ProtocolErrorCode::UnsupportedExternalHandleType,
+        ),
         WireMessage::Welcome { .. }
         | WireMessage::Error { .. }
         | WireMessage::DeviceList { .. }
@@ -127,11 +131,7 @@ fn respond(
     }
 }
 
-fn session_or(
-    session: &Option<Session>,
-    request_id: u64,
-    code: ProtocolErrorCode,
-) -> WireMessage {
+fn session_or(session: &Option<Session>, request_id: u64, code: ProtocolErrorCode) -> WireMessage {
     if session.is_none() {
         error_message(request_id, ProtocolErrorCode::SessionRequired)
     } else {
@@ -192,7 +192,10 @@ mod tests {
         )
         .expect("enumerate");
         match receive_message(&mut client).expect("devices") {
-            WireMessage::DeviceList { request_id, response } => {
+            WireMessage::DeviceList {
+                request_id,
+                response,
+            } => {
                 assert_eq!(request_id, 8);
                 assert!(response.devices.is_empty());
             }
@@ -219,9 +222,15 @@ mod tests {
         )
         .expect("enumerate");
         match receive_message(&mut client).expect("error") {
-            WireMessage::Error { request_id, response } => {
+            WireMessage::Error {
+                request_id,
+                response,
+            } => {
                 assert_eq!(request_id, 3);
-                assert_eq!(response.code, qgs_protocol::ProtocolErrorCode::SessionRequired);
+                assert_eq!(
+                    response.code,
+                    qgs_protocol::ProtocolErrorCode::SessionRequired
+                );
             }
             other => panic!("expected error, got {other:?}"),
         }

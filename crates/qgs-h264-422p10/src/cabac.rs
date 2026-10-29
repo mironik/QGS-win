@@ -181,14 +181,14 @@ impl<'a> CabacDecoder<'a> {
     #[inline(always)]
     pub(crate) fn decode_bin(&mut self, context: &mut CabacContext) -> bool {
         let packed = context.packed;
-        let state = usize::from(packed & 63);
         let mps = packed & 64 != 0;
         let q = usize::from((self.range >> 6) & 0x03);
-        let range_lps = u16::from(RANGE_LPS[state][q]);
+        let step = CABAC_STEPS[usize::from(packed) * 4 + q];
+        let range_lps = (step & 0xff) as u16;
         let range_mps = self.range - range_lps;
         if self.offset < range_mps {
             self.range = range_mps;
-            context.packed = TRANS_PACKED_MPS[usize::from(packed)];
+            context.packed = (step >> 8) as u8;
             if range_mps < 256 {
                 let shift = range_mps.leading_zeros() - 7;
                 self.range = range_mps << shift;
@@ -199,7 +199,7 @@ impl<'a> CabacDecoder<'a> {
             self.offset -= range_mps;
             self.range = range_lps;
             let bin = !mps;
-            context.packed = TRANS_PACKED_LPS[usize::from(packed)];
+            context.packed = (step >> 16) as u8;
             self.renorm();
             bin
         }
@@ -434,6 +434,25 @@ const fn build_packed_transition_tables(lps: bool) -> [u8; 128] {
 const TRANS_PACKED_MPS: [u8; 128] = build_packed_transition_tables(false);
 const TRANS_PACKED_LPS: [u8; 128] = build_packed_transition_tables(true);
 
+const fn build_cabac_steps() -> [u32; 512] {
+    let mut steps = [0_u32; 512];
+    let mut packed = 0;
+    while packed < 128 {
+        let state = packed & 63;
+        let mut q = 0;
+        while q < 4 {
+            steps[packed * 4 + q] = (RANGE_LPS[state][q] as u32)
+                | ((TRANS_PACKED_MPS[packed] as u32) << 8)
+                | ((TRANS_PACKED_LPS[packed] as u32) << 16);
+            q += 1;
+        }
+        packed += 1;
+    }
+    steps
+}
+
+const CABAC_STEPS: [u32; 512] = build_cabac_steps();
+
 #[derive(Debug)]
 pub enum CabacError {
     EndOfSlice,
@@ -458,6 +477,18 @@ impl std::error::Error for CabacError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_steps_match_probability_and_context_transitions() {
+        for packed in 0..128 {
+            for q in 0..4 {
+                let step = CABAC_STEPS[packed * 4 + q];
+                assert_eq!((step & 0xff) as u8, RANGE_LPS[packed & 63][q]);
+                assert_eq!((step >> 8) as u8, TRANS_PACKED_MPS[packed]);
+                assert_eq!((step >> 16) as u8, TRANS_PACKED_LPS[packed]);
+            }
+        }
+    }
 
     #[test]
     fn cabac_initializes_range_and_offset_from_first_nine_bits() {

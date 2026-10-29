@@ -9,7 +9,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or("usage: bench_decode <annex-b.h264>")?;
+        .ok_or("usage: bench_decode <annex-b.h264> [repeats]")?;
+    let repeats: usize = std::env::args()
+        .nth(2)
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(1);
+    if repeats == 0 {
+        return Err("repeats must be positive".into());
+    }
     let bytes = std::fs::read(&input)?;
     let access_units = split_h264_annex_b_access_units(&bytes)?;
     let first = access_units.first().ok_or("no H.264 access units found")?;
@@ -34,22 +42,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     drop(warmup_decoder);
 
-    let start = Instant::now();
-    let mut decoder = H264422P10Decoder::new(profile);
     let mut frames = 0_u64;
     let mut checksum = 0_u64;
-    for access_unit in &access_units {
-        for frame in decoder.submit_access_unit(access_unit)? {
+    let mut durations = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let start = Instant::now();
+        let mut decoder = H264422P10Decoder::new(profile.clone());
+        for access_unit in &access_units {
+            for frame in decoder.submit_access_unit(access_unit)? {
+                checksum = checksum.wrapping_add(sample_checksum(&frame));
+                frames += 1;
+            }
+        }
+        for frame in decoder.flush()? {
             checksum = checksum.wrapping_add(sample_checksum(&frame));
             frames += 1;
         }
+        durations.push(start.elapsed());
     }
-    for frame in decoder.flush()? {
-        checksum = checksum.wrapping_add(sample_checksum(&frame));
-        frames += 1;
-    }
-    let elapsed = start.elapsed();
-    let seconds = elapsed.as_secs_f64();
+    let seconds: f64 = durations.iter().map(|duration| duration.as_secs_f64()).sum();
     let fps = if seconds > 0.0 {
         frames as f64 / seconds
     } else {
@@ -59,9 +70,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("input: {}", input.display());
     println!("bytes: {}", bytes.len());
     println!("access units: {}", access_units.len());
+    println!("repeats: {repeats}");
     println!("frames: {frames}");
     println!("seconds: {seconds:.3}");
     println!("fps: {fps:.2}");
+    let mut per_gop: Vec<f64> = durations.iter().map(|duration| duration.as_secs_f64()).collect();
+    per_gop.sort_by(f64::total_cmp);
+    let median = if repeats % 2 == 0 {
+        (per_gop[repeats / 2 - 1] + per_gop[repeats / 2]) / 2.0
+    } else {
+        per_gop[repeats / 2]
+    };
+    println!("median_gop_seconds: {median:.3}");
     println!("checksum: {}", black_box(checksum));
     Ok(())
 }

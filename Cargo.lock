@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-audio-pipewire"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libspa-sys",
  "pipewire",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-broadcast-player"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-audio-pipewire",
  "qgs-codec-h264",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-codec-h264"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "h264-reader",
  "qgs-protocol",
@@ -1495,14 +1495,14 @@ dependencies = [
 
 [[package]]
 name = "qgs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-protocol",
 ]
 
 [[package]]
 name = "qgs-h264-422p10"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "qgs-codec-h264",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-linux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-core",
  "qgs-protocol",
@@ -1523,14 +1523,14 @@ dependencies = [
 
 [[package]]
 name = "qgs-media-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qnc-qgs-contract",
 ]
 
 [[package]]
 name = "qgs-mp4"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mp4",
  "qgs-codec-h264",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-mxf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-codec-h264",
  "qgs-protocol",
@@ -1547,11 +1547,11 @@ dependencies = [
 
 [[package]]
 name = "qgs-protocol"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "qgs-software-video"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-core",
  "qgs-protocol",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-test"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-audio-pipewire",
  "qgs-broadcast-player",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-vaapi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libva",
  "qgs-codec-h264",
@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "qgs-vulkan"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ash",
  "qgs-core",
@@ -1599,14 +1599,14 @@ dependencies = [
 
 [[package]]
 name = "qgs-win"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-windows",
 ]
 
 [[package]]
 name = "qgs-windows"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-core",
  "qgs-protocol",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "qgsd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-core",
  "qgs-linux",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-qgs-bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qgs-media-runtime",
  "qnc-qgs-contract",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-qgs-contract"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "quick-xml"

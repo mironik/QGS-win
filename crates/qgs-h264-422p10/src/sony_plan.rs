@@ -12,9 +12,9 @@ use crate::macroblock::{
 };
 use crate::macroblock_type::MacroblockAddress;
 use crate::motion::{
-    predict_bi_inter_16x16, predict_bi_inter_chroma_16x16_blocks, predict_bi_inter_luma_16x16_block,
-    predict_inter_16x16, predict_inter_chroma_16x16_blocks, predict_inter_luma_16x16_block,
-    MotionVectorQuarterPel,
+    predict_bi_inter_16x16, predict_bi_inter_chroma_16x16_blocks,
+    predict_bi_inter_luma_16x16_block, predict_inter_16x16, predict_inter_chroma_16x16_blocks,
+    predict_inter_luma_16x16_block, MotionVectorQuarterPel,
 };
 use crate::residual::{ResidualBlock4x4, ResidualBlock8x8};
 
@@ -104,6 +104,7 @@ impl SonySlicePlan {
         index
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
@@ -128,6 +129,20 @@ impl From<crate::motion::MotionCompensationError> for PlanExecuteError {
     }
 }
 
+#[inline(always)]
+fn kernel_class(kernel: PlanKernel) -> u8 {
+    match kernel {
+        PlanKernel::L0 { .. } => 0,
+        PlanKernel::L1 { .. } => 1,
+        PlanKernel::Bi { .. } => 2,
+    }
+}
+
+#[inline(always)]
+fn has_residual(command: &PlanCommand) -> bool {
+    !(matches!(command.luma, PlanLumaResidual::Absent) && command.chroma.is_none())
+}
+
 struct LocalPred {
     luma: [u16; 16 * 16],
     cb: [u16; 8 * 16],
@@ -135,7 +150,7 @@ struct LocalPred {
 }
 
 impl LocalPred {
-    fn new() -> Self {
+    fn zeroed() -> Self {
         Self {
             luma: [0; 16 * 16],
             cb: [0; 8 * 16],
@@ -146,91 +161,86 @@ impl LocalPred {
 
 /// Executes the plan with homogeneous kernel batches on one core.
 ///
-/// Zero-residual commands write prediction straight into the frame. Coded
-/// commands software-pipeline predict(N+1) while residual(N) runs on a second
-/// local buffer. Batches are L0/L1/Bi × absent/coded.
+/// Commands are sorted in-place by (kernel class, residual flag) so L0/L1/Bi
+/// absent runs form long monomorphic loops, then coded runs software-pipeline
+/// predict(N+1) with residual(N) on double buffers.
 pub(crate) fn execute_sony_slice_plan(
     plan: &mut SonySlicePlan,
     list0: &[&DecodedFrame422P10],
     list1: &[&DecodedFrame422P10],
     target: &mut DecodedFrame422P10,
 ) -> Result<(), PlanExecuteError> {
-    let count = plan.commands.len();
-    if count == 0 {
+    if plan.commands.is_empty() {
         return Ok(());
     }
 
-    let mut buckets: [Vec<usize>; 6] = [
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    ];
-    for (index, command) in plan.commands.iter().enumerate() {
-        let class = match command.kernel {
-            PlanKernel::L0 { .. } => 0_usize,
-            PlanKernel::L1 { .. } => 1_usize,
-            PlanKernel::Bi { .. } => 2_usize,
-        };
-        let residual = usize::from(
-            !(matches!(command.luma, PlanLumaResidual::Absent) && command.chroma.is_none()),
-        );
-        buckets[class * 2 + residual].push(index);
-    }
+    plan.commands.sort_unstable_by_key(|command| {
+        (
+            kernel_class(command.kernel),
+            u8::from(has_residual(command)),
+        )
+    });
 
-    for class in 0..3 {
-        // Absent residual: direct-to-frame, monomorphic by list class.
-        for &index in &buckets[class * 2] {
-            let command = plan.commands[index];
-            predict_into_frame(command.kernel, list0, list1, command.address, target)?;
+    let mut index = 0;
+    let total = plan.commands.len();
+    while index < total {
+        let class = kernel_class(plan.commands[index].kernel);
+        let residual = has_residual(&plan.commands[index]);
+        let mut end = index + 1;
+        while end < total
+            && kernel_class(plan.commands[end].kernel) == class
+            && has_residual(&plan.commands[end]) == residual
+        {
+            end += 1;
         }
 
-        // Coded residual: software-pipeline MC(N+1) with IDCT(N).
-        let coded = &buckets[class * 2 + 1];
-        if coded.is_empty() {
-            continue;
-        }
-        let mut buf_a = LocalPred::new();
-        let mut buf_b = LocalPred::new();
-        let first = plan.commands[coded[0]];
-        predict_command(
-            first.kernel,
-            list0,
-            list1,
-            first.address,
-            &mut buf_a.luma,
-            &mut buf_a.cb,
-            &mut buf_a.cr,
-        )?;
-        let mut use_a = true;
-        for pos in 0..coded.len() {
-            let command = plan.commands[coded[pos]];
-            if pos + 1 < coded.len() {
-                let next = plan.commands[coded[pos + 1]];
-                let next_buf = if use_a { &mut buf_b } else { &mut buf_a };
-                predict_command(
-                    next.kernel,
-                    list0,
-                    list1,
-                    next.address,
-                    &mut next_buf.luma,
-                    &mut next_buf.cb,
-                    &mut next_buf.cr,
-                )?;
+        if !residual {
+            for command in &plan.commands[index..end] {
+                predict_into_frame(command.kernel, list0, list1, command.address, target)?;
             }
-            let cur = if use_a { &mut buf_a } else { &mut buf_b };
-            apply_residual(
-                plan,
-                command,
-                target,
-                &mut cur.luma,
-                &mut cur.cb,
-                &mut cur.cr,
+        } else {
+            let mut buf_a = LocalPred::zeroed();
+            let mut buf_b = LocalPred::zeroed();
+            let first = plan.commands[index];
+            predict_command(
+                first.kernel,
+                list0,
+                list1,
+                first.address,
+                &mut buf_a.luma,
+                &mut buf_a.cb,
+                &mut buf_a.cr,
             )?;
-            use_a = !use_a;
+            let mut use_a = true;
+            let count = end - index;
+            for pos in 0..count {
+                let command = plan.commands[index + pos];
+                if pos + 1 < count {
+                    let next = plan.commands[index + pos + 1];
+                    let next_buf = if use_a { &mut buf_b } else { &mut buf_a };
+                    predict_command(
+                        next.kernel,
+                        list0,
+                        list1,
+                        next.address,
+                        &mut next_buf.luma,
+                        &mut next_buf.cb,
+                        &mut next_buf.cr,
+                    )?;
+                }
+                let cur = if use_a { &mut buf_a } else { &mut buf_b };
+                apply_residual(
+                    plan,
+                    command,
+                    target,
+                    &mut cur.luma,
+                    &mut cur.cb,
+                    &mut cur.cr,
+                )?;
+                use_a = !use_a;
+            }
         }
+        index = end;
     }
 
     plan.clear();

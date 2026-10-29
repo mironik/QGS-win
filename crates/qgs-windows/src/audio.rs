@@ -67,23 +67,11 @@ pub(crate) fn play_f32le_interleaved(
 
     let frame_bytes = usize::from(channels) * 4;
     let mut offset = 0;
-    write_available(
-        &audio_client,
-        &render_client,
-        pcm,
-        &mut offset,
-        frame_bytes,
-    )?;
+    write_available(&audio_client, &render_client, pcm, &mut offset, frame_bytes)?;
     audio_client.start_stream().map_err(backend)?;
     while offset < pcm.len() {
         event.wait_for_event(2_000).map_err(backend)?;
-        write_available(
-            &audio_client,
-            &render_client,
-            pcm,
-            &mut offset,
-            frame_bytes,
-        )?;
+        write_available(&audio_client, &render_client, pcm, &mut offset, frame_bytes)?;
     }
 
     let frames = (pcm.len() / frame_bytes) as u64;

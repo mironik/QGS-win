@@ -29,10 +29,7 @@ impl fmt::Display for WindowsAudioError {
 
 impl std::error::Error for WindowsAudioError {}
 
-pub(crate) fn validate_format(
-    sample_rate: u32,
-    channels: u16,
-) -> Result<(), WindowsAudioError> {
+pub(crate) fn validate_format(sample_rate: u32, channels: u16) -> Result<(), WindowsAudioError> {
     if sample_rate == 0 {
         return Err(WindowsAudioError::InvalidPcm("sample rate is zero"));
     }
